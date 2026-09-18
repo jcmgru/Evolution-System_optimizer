@@ -21,7 +21,7 @@ import subprocess
 # ==================================================================
 
 PAYPAL_FUNDING = "juancamazo17@gmail.com"
-PAYPAL_LINK = "https://paypal.com"
+PAYPAL_LINK = "https://www.paypal.com/donate/?hosted_button_id=XBX3CXHFXMD9Y"
 GRASS_LINK =  "https://app.grass.io/register?referralCode=xmpnmoiR2V4z7R4"
 
 def verificar_e_instalar_entorno(sistema_actual):
