@@ -1,0 +1,56 @@
+name: Compilar Instaladores de Un Clic
+
+on:
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Configurar Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        
+    - name: Instalar Herramientas de Compilacion
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller psutil
+        
+    - name: Generar ejecutable Windows (.exe)
+      run: |
+        pyinstaller --onefile --uac-admin --name="Evolution_Setup_Windows" Evolution_Setup.py
+        
+    - name: Subir Instalador Windows
+      uses: actions/upload-artifact@v4
+      with:
+        name: Evolution_Setup_Windows
+        path: dist/Evolution_Setup_Windows.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Configurar Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        
+    - name: Instalar Herramientas de Compilacion
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller psutil
+        
+    - name: Generar executable Linux (Binario)
+      run: |
+        pyinstaller --onefile --name="Evolution_Setup_Linux" Evolution_Setup.py
+        
+    - name: Subir Instalador Linux
+      uses: actions/upload-artifact@v4
+      with:
+        name: Evolution_Setup_Linux
+        path: dist/Evolution_Setup_Linux
