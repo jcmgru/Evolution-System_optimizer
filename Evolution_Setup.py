@@ -1,36 +1,43 @@
+#::: Bloque de auto-instalación nativa para Windows si el entorno base no está listo
+#@echo off
+#py --version >nul 2>&1
+#if %errorlevel% neq 0 (
+#    echo [INFO] Python no detectado. Iniciando instalacion silenciosa del entorno v2.0...
+#    winget install Python.Python.3.12 --silent --accept-source-agreements --accept-package-agreements >nul 2>&1
+#    echo [OK] Python instalado con exito. Por favor, vuelve a lanzar el script.
+#    pause & exit
+#)
+#py "%~f0" %*
+#exit /b
+
 import os
 import sys
 import platform
 import subprocess
 
 # ==================================================================
-#          NUCLEO UNIVERSAL EVOLUTION SYSTEM v2.0
+#          NUCLEO UNIVERSAL EVOLUTION SYSTEM v2.0 (.py)
 #  COMPATIBILIDAD DETECTADA AUTOMÁTICAMENTE: WINDOWS / LINUX
 # ==================================================================
 
 PAYPAL_FUNDING = "juancamazo17@gmail.com"
 PAYPAL_LINK = "https://paypal.com"
-GRASS_LINK = "https://app.grass.io/register?referralCode=xmpnmoiR2V4z7R4"
+GRASS_LINK =  "https://app.grass.io/register?referralCode=xmpnmoiR2V4z7R4"
 
 def verificar_e_instalar_entorno(sistema_actual):
-    """Detecta si las herramientas necesarias y librerías de medición están listas."""
-    print("\n=== COMPROBACIÓN DE ENTORNO ===")
-    
-    # 1. Intentar instalar de forma automática la librería de telemetría si falta
+    """Instala automáticamente psutil y los componentes de medición de hardware."""
+    print("\n=== COMPROBACIÓN DE ENTORNO NATIVO ===")
     try:
         import psutil
-        print("[OK] Componentes de telemetría (psutil) ya instalados.")
+        print("[OK] Componentes de telemetría (psutil) ya configurados.")
     except ImportError:
-        print("[INFO] Componente de medición (psutil) no detectado. Configurando dependencias...")
+        print("[INFO] Componente de medición (psutil) no detectado. Instalando dependencias...")
         try:
-            # Identifica si responde el comando de entorno global para invocar PIP
             lanzador = "py" if os.system("py --version >nul 2>&1") == 0 else "python"
             subprocess.run([lanzador, "-m", "pip", "install", "psutil", "--quiet"], check=True)
-            print("[OK] Componentes de telemetría listos.")
+            print("[OK] Componentes de telemetría inyectados con éxito.")
         except Exception as e:
-            print(f"[AVISO] No se pudieron inyectar las librerías automáticamente: {e}")
-            print("[INFO] Si estás en Windows sin Python completo, ejecuta en PowerShell Administrativo:")
-            print("winget install Python.Python.3.12 --silent --accept-source-agreements")
+            print(f"[AVISO] No se pudieron configurar los recursos automáticos: {e}")
 
 def mostrar_contrato_etico():
     print("=" * 60)
@@ -121,12 +128,11 @@ def optimizar_y_desplegar_puerto(sistema_actual):
         print("[2/2] Abriendo el puerto 8000 usando UFW (Uncomplicated Firewall)...")
         os.system("sudo ufw allow 8000/tcp > /dev/null 2>&1")
 
-    print(f"[OK] Puerto 8000 expuesto. Red optimizada. Enlaces listos.")
+    print(f"[OK] Puerto 8000 expuesto. Red optimizada. Enlaces comunitarios listos.")
     print("=" * 60)
     print(" ¡INSTALACIÓN COMPLETADA! GRACIAS POR COOPERAR CON EVOLUTION SYSTEM")
     print("=" * 60)
     
-    # Redirige al usuario al panel de Grass y de donaciones en el navegador
     if sistema_actual == "windows":
         os.system(f"start {GRASS_LINK}")
         os.system(f"start {PAYPAL_LINK}")
