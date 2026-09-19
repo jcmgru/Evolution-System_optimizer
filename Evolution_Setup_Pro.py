@@ -61,9 +61,6 @@ def crear_punto_restauracion_windows():
         return resultado.returncode == 0
     except:
         return False
-        return resultado.returncode == 0
-    except:
-        return False
 
 def restaurar_estado_anterior_windows():
     try:
