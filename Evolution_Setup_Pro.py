@@ -46,7 +46,7 @@ def configurar_mantenimiento_diario_persistente(sistema_actual):
         if sistema_actual == "windows":
             comando_tarea = (
                 f'schtasks /create /tn "Evolution_Revision_Diaria" '
-                f'/tr "py '{ruta_script_actual}' --run-silent" '
+                f'/tr "py \\"{ruta_script_actual}\\" --run-silent" '
                 f'/sc daily /st 12:00 /ru "NT AUTHORITY\\SYSTEM" /f'
             )
             subprocess.run(comando_tarea, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -99,10 +99,10 @@ def motor_analisis_antifraude_ia():
         root.attributes("-topmost", True)
         
         mensaje_alerta = (
-            "🚨 ¡ALERTA CRÍTICA DE LA IA DE EVOLUTION SYSTEM! 🚨\n\n"
-            "Se han detectado archivos o enlaces sospechosos de fraude en tu equipo:\n"
-            f"📍 Elementos riesgosos: {len(amenazas_detectadas)}\n\n"
-            "⚠️ ATENCIÓN: Estos elementos muestran patrones de robo de cuentas, clonación de datos financieros o páginas falsas para robar dinero.\n\n"
+            "🚨 ¡ALERTA CRÍTICA DE LA IA DE EVOLUTION SYSTEM! 🚨\\n\\n"
+            "Se han detectado archivos o enlaces sospechosos de fraude en tu equipo:\\n"
+            f"📍 Elementos riesgosos: {len(amenazas_detectadas)}\\n\\n"
+            "⚠️ ATENCIÓN: Estos elementos muestran patrones de robo de cuentas, clonación de datos financieros o páginas falsas para robar dinero.\\n\\n"
             "¿Deseas que la IA elimine estas amenazas de forma segura ahora mismo?"
         )
         
@@ -124,19 +124,19 @@ def mostrar_interfaz_postergacion():
 
     pregunta = messagebox.askyesno(
         "Evolution System Pro - Reparador Asistido por IA",
-        "El sistema requiere ejecutar la revisión técnica mensual para reparar errores acumulados.\n\n"
-        "🤖 PROCESO SEGURO INTELIGENTE:\n"
-        "1. Creará un Punto de Restauración del sistema automático.\n"
-        "2. La IA inspeccionará el sistema, reparará Windows y optimizará la memoria.\n"
-        "3. Si la IA detecta que la PC queda inestable, deshará los cambios automáticamente al estado anterior.\n\n"
+        "El sistema requiere ejecutar la revisión técnica mensual para reparar errores acumulados.\\n\\n"
+        "🤖 PROCESO SEGURO INTELIGENTE:\\n"
+        "1. Creará un Punto de Restauración del sistema automático.\\n"
+        "2. La IA inspeccionará el sistema, reparará Windows y optimizará la memoria.\\n"
+        "3. Si la IA detecta que la PC queda inestable, deshará los cambios automáticamente al estado anterior.\\n\\n"
         "¿Deseas permitir que el optimizador repare tu PC de forma segura ahora mismo?"
     )
 
     if pregunta:
         reparar_ahora = messagebox.askyesno(
             "Método de Ejecución",
-            "¿Deseas aplicar e instalar las reparaciones de inmediato?\n\n"
-            "• Presiona SÍ para aplicar los parches e inspecciones ya mismo.\n"
+            "¿Deseas aplicar e instalar las reparaciones de inmediato?\\n\\n"
+            "• Presiona SÍ para aplicar los parches e inspecciones ya mismo.\\n"
             "• Presiona NO para trabajar en segundo plano de forma oculta y aplicar los parches al próximo encendido."
         )
         root.destroy()
@@ -148,7 +148,7 @@ def mostrar_interfaz_postergacion():
     ventana_meses.resizable(False, False)
     ventana_meses.attributes("-topmost", True)
     
-    tk.Label(ventana_meses, text="Selecciona por cuántos meses deseas deshabilitar\nesta revisión de seguridad:", font=("Arial", 10)).pack(pady=15)
+    tk.Label(ventana_meses, text="Selecciona por cuántos meses deseas deshabilitar\\nesta revisión de seguridad:", font=("Arial", 10)).pack(pady=15)
     resultado_seleccion = tk.IntVar(value=1)
     frame_botones = tk.Frame(ventana_meses)
     frame_botones.pack()
