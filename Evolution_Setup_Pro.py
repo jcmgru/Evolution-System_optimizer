@@ -55,7 +55,7 @@ def configurar_mantenimiento_diario_persistente(sistema_actual):
 
 def crear_punto_restauracion_windows():
     try:
-        subprocess.run('powershell -Command "Enable-ComputerRestore -Drive 'C:\\'"', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run('''powershell -Command "Enable-ComputerRestore -Drive 'C:\'"''', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         cmd_crear = 'powershell -Command "Checkpoint-Computer -Description 'Antes_de_Mantenimiento_Evolution' -RestorePointType MODIFY_SETTINGS"'
         resultado = subprocess.run(cmd_crear, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return resultado.returncode == 0
