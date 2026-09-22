@@ -31,13 +31,13 @@ jobs:
 
       - name: Execute PyInstaller Production Build
         run: |
-          pyinstaller --clean --onefile --noconsole --name="evolution_v5.1" --add-data "README.md;." "Evolution System v5.1 final"
+          pyinstaller --clean --onefile --noconsole --name="evolution_v5.1_final" --add-data "README.md;." "Evolution System v5.1 final"
 
       - name: Upload Windows Production Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Evolution_v5.1_Windows_x64
-          path: dist/evolution_v5.1.exe
+          name: Evolution_v5.1_Windows_x64_Final
+          path: dist/evolution_v5.1_final.exe
           retention-days: 5
 
   build-linux:
@@ -61,11 +61,11 @@ jobs:
 
       - name: Execute PyInstaller Linux Build
         run: |
-          pyinstaller --clean --onefile --name="evolution_v5.1_linux" "Evolution System v5.1 final"
+          pyinstaller --clean --onefile --name="evolution_v5.1_linux_final" "Evolution System v5.1 final"
 
       - name: Upload Linux Production Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Evolution_v5.1_Linux_x64
-          path: dist/evolution_v5.1_linux
+          name: Evolution_v5.1_Linux_x64_Final
+          path: dist/evolution_v5.1_linux_final
           retention-days: 5
