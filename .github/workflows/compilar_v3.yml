@@ -1,0 +1,49 @@
+name: Compilacion Multiplataforma Evolution v3.0
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - name: Clonar Codigo
+      uses: actions/checkout@v4
+    - name: Entorno Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Herramientas
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+    - name: Compilar Windows EXE
+      run: pyinstaller --onefile --uac-admin --name="Evolution_Setup_Windows_v3.0" evolution_v3.py
+    - name: Desplegar Artefacto Windows
+      uses: actions/upload-artifact@v4
+      with:
+        name: Evolution_v3.0_Windows_x64
+        path: dist/Evolution_Setup_Windows_v3.0.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Clonar Codigo
+      uses: actions/checkout@v4
+    - name: Entorno Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Herramientas
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+    - name: Compilar Linux Binario
+      run: pyinstaller --onefile --name="Evolution_Setup_Linux_v3.0" evolution_v3.py
+    - name: Desplegar Artefacto Linux
+      uses: actions/upload-artifact@v4
+      with:
+        name: Evolution_v3.0_Linux_x64
+        path: dist/Evolution_Setup_Linux_v3.0
