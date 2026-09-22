@@ -36,7 +36,7 @@ jobs:
       - name: Upload Windows Production Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: evolution-system-v4.0.1-windows-x64
+          name: Evolution_v4.0.1_Windows_x64
           path: dist/evolution_v4.0.1.exe
           retention-days: 5
 
@@ -66,6 +66,6 @@ jobs:
       - name: Upload Linux Production Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: evolution-system-v4.0.1-linux-x64
+          name: Evolution_v4.0.1_Linux_x64
           path: dist/evolution_v4.0.1_linux
           retention-days: 5
