@@ -1,0 +1,71 @@
+name: Evolution System v4.0.1 - Quantum Core Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Compilation Target - Windows x64 v4.0.1 (.exe)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Initialize Production Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Compiling Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: Execute PyInstaller Production Build
+        run: |
+          pyinstaller --clean --onefile --noconsole --name="evolution_v4.0.1" --add-data "README.md;." "Evolution System v4.0.1 final"
+
+      - name: Upload Windows Production Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: evolution-system-v4.0.1-windows-x64
+          path: dist/evolution_v4.0.1.exe
+          retention-days: 5
+
+  build-linux:
+    name: Compilation Target - Linux x64 v4.0.1 (Binary)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Initialize Production Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Compiling Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: Execute PyInstaller Linux Build
+        run: |
+          pyinstaller --clean --onefile --name="evolution_v4.0.1_linux" "Evolution System v4.0.1 final"
+
+      - name: Upload Linux Production Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: evolution-system-v4.0.1-linux-x64
+          path: dist/evolution_v4.0.1_linux
+          retention-days: 5
