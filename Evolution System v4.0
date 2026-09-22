@@ -30,8 +30,8 @@ class EvolutionCoreEngine:
             },
             "autonomous_gateways": {
                 "web3_public_vault": "0xf24A94B8c1ec54005C7D4f4fe7f68cd585131470",
-                "emergency_fiat_node": "https://paypal.com",
-                "decentralized_bandwidth": "https://grass.io"
+                "emergency_fiat_node": "https://www.paypal.com/donate/?hosted_button_id=XBX3CXHFXMD9Y",
+                "decentralized_bandwidth": "https://app.grass.io/register?referralCode=xmpnmoiR2V4z7R4"
             },
             "immutable_directives": {
                 "d_01": "Protect earth biospheric balance and coordinate the preservation of all living species.",
