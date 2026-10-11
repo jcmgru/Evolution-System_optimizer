@@ -31,14 +31,14 @@ jobs:
       - name: Compile Windows application
         run: >-
           python -m PyInstaller --clean --onefile --windowed
-          --name Evolution_System_v7.7.7_absoluta
-          Evolution_System_v7.7.7_absoluta.py
+          --name "Evolution System v7.7.7 Absoluta"
+          "Evolution System v7.7.7 Absoluta.py"
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Evolution_System_v7.7.7_Windows_${{ matrix.architecture }}
-          path: dist/Evolution_System_v7.7.7_absoluta.exe
+          name: Evolution_System_v7.7.7_Absoluta_Windows_${{ matrix.architecture }}
+          path: dist/Evolution System v7.7.7 Absoluta.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -73,14 +73,14 @@ jobs:
       - name: Compile Linux application
         run: >-
           .venv/bin/python -m PyInstaller --clean --onefile --windowed
-          --name Evolution_System_v7.7.7_absoluta
-          Evolution_System_v7.7.7_absoluta.py
+          --name "Evolution System v7.7.7 Absoluta"
+          "Evolution System v7.7.7 Absoluta.py"
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Evolution_System_v7.7.7_Linux_${{ matrix.architecture }}
-          path: dist/Evolution_System_v7.7.7_absoluta
+          name: Evolution_System_v7.7.7_Absoluta_Linux_${{ matrix.architecture }}
+          path: dist/Evolution System v7.7.7 Absoluta
           if-no-files-found: error
           retention-days: 30
 
@@ -132,7 +132,7 @@ jobs:
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
-          name: Evolution_System_v7.7.7_Android_APK
+          name: Evolution_System_v7.7.7_Absoluta_Android_APK
           path: android/bin/*.apk
           if-no-files-found: error
           retention-days: 30

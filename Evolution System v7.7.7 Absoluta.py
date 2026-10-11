@@ -13,7 +13,7 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 
-APP_TITLE = "Evolution System v7.7.7 Absoluta - Nodo local"
+APP_TITLE = "Evolution System - Versión 7.7.7 Absoluta"
 STARTUP_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "EvolutionSystemV6"
 LOG_FLUSH_INTERVAL_MS = 15 * 60 * 1000

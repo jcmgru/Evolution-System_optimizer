@@ -12,7 +12,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 
 
-APP_TITLE = "Evolution System v7.7.7 Absoluta"
+APP_TITLE = "Evolution System - Versión 7.7.7 Absoluta"
 CREATOR = "Juan Camilo Mazo González (jcmgru)"
 ORGANIZATION = "Proyectos Geniales"
 CONTACT = "jcmgru7@gmail.com"
