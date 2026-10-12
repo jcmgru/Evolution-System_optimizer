@@ -1476,12 +1476,6 @@ class EvolutionNodeApp:
         self.root.minsize(700, 570)
 
         self.startup_enabled = False
-        startup_error = None
-        if platform.system().lower() == "windows":
-            try:
-                self.startup_enabled = is_startup_enabled()
-            except OSError as error:
-                startup_error = error
         self.startup_var = tk.BooleanVar(value=self.startup_enabled)
         self.startup_status = tk.StringVar(
             value=(
@@ -1501,31 +1495,70 @@ class EvolutionNodeApp:
         self._build_interface()
         self._refresh_hardware()
         self._start_cpu_monitor()
-        if startup_error:
-            messagebox.showerror(
-                APP_TITLE,
-                "No se pudo consultar la configuración de inicio de Windows:\n{}".format(
-                    startup_error
-                ),
-            )
         self.tray_icon = None
         if platform.system().lower() == "windows":
-            try:
-                self.tray_icon = WindowsTrayIcon(
-                    self.root,
-                    self.show_window,
-                    self.close,
-                    "Evolution v7.7.7 - malla desconectada",
-                )
-            except OSError as error:
-                messagebox.showerror(
-                    APP_TITLE,
-                    "No se pudo crear el icono de la bandeja. "
-                    "Cerrar la ventana finalizará el programa.\n\n{}".format(error),
-                )
+            self.root.after(250, self._initialize_tray_icon)
+            self._load_startup_setting_async()
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self.root.after(LOG_FLUSH_INTERVAL_MS, self._periodic_flush)
-        self.root.after(100, self._show_privilege_notice)
+        self.root.after(700, self._show_privilege_notice)
+
+    def _initialize_tray_icon(self):
+        if self.closing or not self.root.winfo_exists():
+            return
+        try:
+            self.tray_icon = WindowsTrayIcon(
+                self.root,
+                self.show_window,
+                self.close,
+                "Evolution v7.7.7 - malla desconectada",
+            )
+        except OSError as error:
+            messagebox.showerror(
+                APP_TITLE,
+                "No se pudo crear el icono de la bandeja. "
+                "Cerrar la ventana finalizará el programa.\n\n{}".format(error),
+                parent=self.root,
+            )
+
+    def _load_startup_setting_async(self):
+        def read_setting():
+            try:
+                enabled = is_startup_enabled()
+            except OSError as error:
+                self.root.after(
+                    0, lambda error=error: self._show_startup_read_error(error)
+                )
+            else:
+                self.root.after(
+                    0, lambda enabled=enabled: self._apply_startup_setting(enabled)
+                )
+
+        threading.Thread(
+            target=read_setting, name="EvolutionStartupSetting", daemon=True
+        ).start()
+
+    def _apply_startup_setting(self, enabled):
+        if self.closing or not self.root.winfo_exists():
+            return
+        self.startup_enabled = enabled
+        self.startup_var.set(enabled)
+        self.startup_status.set(
+            "Evolution se abrirá al iniciar sesión en Windows."
+            if enabled
+            else "Desactivado; no se iniciará automáticamente."
+        )
+
+    def _show_startup_read_error(self, error):
+        if self.closing or not self.root.winfo_exists():
+            return
+        messagebox.showerror(
+            APP_TITLE,
+            "No se pudo consultar la configuración de inicio de Windows:\n{}".format(
+                error
+            ),
+            parent=self.root,
+        )
 
     def _show_privilege_notice(self):
         if self.closing or not self.root.winfo_exists():
@@ -1746,17 +1779,38 @@ class EvolutionNodeApp:
         )
 
     def _refresh_hardware(self):
-        try:
-            logical_cpus, total_ram, available_ram = get_hardware_info()
-            self.hardware_status.set(
-                "Hardware detectado: {} procesadores lógicos | RAM total: {} | RAM disponible: {}".format(
-                    logical_cpus,
-                    format_bytes(total_ram),
-                    format_bytes(available_ram),
+        def read_hardware():
+            try:
+                hardware = get_hardware_info()
+            except (OSError, ValueError) as error:
+                self.root.after(
+                    0, lambda error=error: self._show_hardware_error(error)
                 )
+            else:
+                self.root.after(
+                    0, lambda hardware=hardware: self._apply_hardware_info(hardware)
+                )
+
+        threading.Thread(
+            target=read_hardware, name="EvolutionHardwareProbe", daemon=True
+        ).start()
+
+    def _apply_hardware_info(self, hardware):
+        if self.closing or not self.root.winfo_exists():
+            return
+        logical_cpus, total_ram, available_ram = hardware
+        self.hardware_status.set(
+            "Hardware detectado: {} procesadores lógicos | RAM total: {} | RAM disponible: {}".format(
+                logical_cpus,
+                format_bytes(total_ram),
+                format_bytes(available_ram),
             )
-        except Exception as error:
-            self.hardware_status.set("No se pudo detectar el hardware: {}".format(error))
+        )
+
+    def _show_hardware_error(self, error):
+        if self.closing or not self.root.winfo_exists():
+            return
+        self.hardware_status.set("No se pudo detectar el hardware: {}".format(error))
 
     def _start_cpu_monitor(self):
         def monitor():
@@ -2744,6 +2798,8 @@ def main():
         return
 
     root = tk.Tk()
+    root.withdraw()
+    root.configure(background="#f0f0f0")
     try:
         record_store = LocalRecordStore(get_log_path())
         record_store.add("NODO PRINCIPAL / COOPERANTE", VOLUNTEER_ROLE)
@@ -2757,11 +2813,9 @@ def main():
         root.destroy()
         release_single_instance(instance_handle)
         return
-    root.deiconify()
-    root.lift()
-    root.update_idletasks()
-    root.update()
     try:
+        root.deiconify()
+        root.after_idle(root.lift)
         root.mainloop()
     finally:
         release_single_instance(instance_handle)
