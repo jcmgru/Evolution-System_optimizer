@@ -1,15 +1,10 @@
-import base64
 import ctypes
 import gc
-import hashlib
-import hmac
 import json
 import os
 import platform
 import queue
-import secrets
 import socket
-import struct
 import subprocess
 import sys
 import threading
@@ -18,7 +13,7 @@ import tkinter as tk
 import uuid
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import messagebox, ttk
 
 
 APP_TITLE = "Evolution System - Versión 7.7.7 Absoluta"
@@ -26,17 +21,14 @@ STARTUP_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "EvolutionSystemV6"
 LOG_FLUSH_INTERVAL_MS = 15 * 60 * 1000
 INSTANCE_MUTEX_NAME = "Local\\EvolutionSystemV777Absoluta"
-CREATOR_USERNAME = "jcmgru el inmortal"
-CREATOR_PASSWORD_HASH_ITERATIONS = 600_000
-CREATOR_TOTP_DIGITS = 6
-CREATOR_TOTP_PERIOD_SECONDS = 30
 LAN_DISCOVERY_PORT = 5005
 LAN_DISCOVERY_INTERVAL_SECONDS = 2
 LAN_PEER_TIMEOUT_SECONDS = 8
 GLOBAL_BOOTSTRAP_PORT = 50001
 CPU_PAUSE_THRESHOLD_PERCENT = 95.0
-CREATOR_ROLE = "USUARIO MAESTRO / CREADOR"
 VOLUNTEER_ROLE = "Nodo Secundario / Voluntario"
+MESH_BOOTSTRAP = ""
+MESH_CACHE_FILENAME = "evolution_peers.txt"
 APP_ATTRIBUTION = (
     "Creado por Juan Camilo Mazo González (jcmgru) | ProyectosGeniales | "
     "jcmgru7@gmail.com"
@@ -55,105 +47,19 @@ def get_windows_folder(csidl):
     return Path(folder_path.value)
 
 
-def generate_totp_secret():
-    return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+def get_mesh_cache_path():
+    return get_log_path().parent / MESH_CACHE_FILENAME
 
 
-def decode_totp_secret(secret):
-    normalized_secret = "".join(secret.split()).upper()
-    padding = "=" * ((8 - len(normalized_secret) % 8) % 8)
-    key = base64.b32decode(normalized_secret + padding, casefold=True)
-    if len(key) < 20:
-        raise ValueError("La semilla TOTP debe contener al menos 160 bits.")
-    return normalized_secret, key
-
-
-def verify_totp(secret, code, timestamp=None):
-    normalized_code = code.strip()
-    if len(normalized_code) != CREATOR_TOTP_DIGITS or not normalized_code.isdigit():
-        return False
-    try:
-        _, key = decode_totp_secret(secret)
-    except (ValueError, base64.binascii.Error):
-        return False
-
-    current_time = time.time() if timestamp is None else timestamp
-    counter = int(current_time // CREATOR_TOTP_PERIOD_SECONDS)
-    for offset in (-1, 0, 1):
-        message = struct.pack(">Q", counter + offset)
-        digest = hmac.new(key, message, hashlib.sha1).digest()
-        offset = digest[-1] & 0x0F
-        binary_code = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
-        expected = str(binary_code % (10 ** CREATOR_TOTP_DIGITS)).zfill(
-            CREATOR_TOTP_DIGITS
-        )
-        if hmac.compare_digest(normalized_code, expected):
-            return True
-    return False
-
-
-def get_creator_auth_path():
-    return get_log_path().parent / "creator_auth.json"
-
-
-def derive_creator_password_hash(password, salt):
-    return hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt,
-        CREATOR_PASSWORD_HASH_ITERATIONS,
-    )
-
-
-def load_creator_auth():
-    path = get_creator_auth_path()
-    with path.open("r", encoding="utf-8") as auth_file:
-        auth_data = json.load(auth_file)
-    if auth_data.get("version") != 1:
-        raise ValueError("Versión de credenciales de creador no reconocida.")
-    if auth_data.get("iterations") != CREATOR_PASSWORD_HASH_ITERATIONS:
-        raise ValueError("Parámetros de credenciales de creador no válidos.")
-    salt = bytes.fromhex(auth_data["password_salt"])
-    password_hash = bytes.fromhex(auth_data["password_hash"])
-    totp_secret, _ = decode_totp_secret(auth_data["totp_secret"])
-    if len(salt) != 16 or len(password_hash) != hashlib.sha256().digest_size:
-        raise ValueError("Datos de credenciales de creador incompletos.")
-    return {
-        "password_salt": salt,
-        "password_hash": password_hash,
-        "totp_secret": totp_secret,
-    }
-
-
-def save_creator_auth(password, totp_secret):
-    path = get_creator_auth_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    salt = secrets.token_bytes(16)
-    auth_data = {
-        "version": 1,
-        "iterations": CREATOR_PASSWORD_HASH_ITERATIONS,
-        "password_salt": salt.hex(),
-        "password_hash": derive_creator_password_hash(password, salt).hex(),
-        "totp_secret": totp_secret,
-    }
-    with path.open("x", encoding="utf-8") as auth_file:
-        json.dump(auth_data, auth_file, separators=(",", ":"))
-        auth_file.write("\n")
-    if platform.system().lower() != "windows":
-        path.chmod(0o600)
-
-
-def verify_creator_password(password, auth_data):
-    candidate = derive_creator_password_hash(password, auth_data["password_salt"])
-    return hmac.compare_digest(candidate, auth_data["password_hash"])
-
-
-def probe_global_bootstrap(host, port=GLOBAL_BOOTSTRAP_PORT, timeout=5):
-    if not host or any(character.isspace() for character in host):
-        raise ValueError("Escribe un dominio No-IP o nombre DNS válido.")
-    address = socket.gethostbyname(host)
-    with socket.create_connection((address, port), timeout=timeout):
-        return address
+def validate_peer_address(host):
+    host = host.strip()
+    if not host or len(host) > 253 or any(character.isspace() for character in host):
+        raise ValueError("Escribe una dirección IP o dominio válido.")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    if any(character in host for character in ("/", "\\", "@", ":")):
+        raise ValueError("Escribe solo una IP o dominio, sin puerto ni URL.")
+    return host
 
 
 def is_startup_enabled():
@@ -550,34 +456,63 @@ class LocalRecordStore:
             self.pending_records.clear()
 
 
-class LanPeerDiscovery:
-    PROTOCOL_ID = "evolution-lan-discovery"
+class P2PPeerMesh:
+    PROTOCOL_ID = "evolution-peer-exchange-v1"
+    MAX_PEERS = 128
+    MAX_MESSAGE_BYTES = 64 * 1024
+    PEER_TIMEOUT_SECONDS = 30 * 60
+    GOSSIP_INTERVAL_SECONDS = 5
+    CACHE_INTERVAL_SECONDS = LOG_FLUSH_INTERVAL_MS / 1000
 
-    def __init__(self, node_id):
+    def __init__(self, node_id, cache_path):
         self.node_id = node_id
+        self.cache_path = cache_path
         self.events = queue.Queue()
         self.stop_event = threading.Event()
-        self.thread = None
-        self.socket = None
+        self.paused_event = threading.Event()
+        self.lock = threading.Lock()
+        self.cache_lock = threading.Lock()
+        self.connection_slots = threading.BoundedSemaphore(16)
         self.peers = {}
-        self.seen_peers = set()
+        self.sockets = []
+        self.threads = []
+        self.gossip_offset = 0
 
-    def start(self):
-        if self.thread and self.thread.is_alive():
+    def start(self, bootstrap_host=""):
+        if any(thread.is_alive() for thread in self.threads):
             return
         self.stop_event.clear()
-        self.thread = threading.Thread(
-            target=self._run, name="EvolutionLanDiscovery", daemon=True
-        )
-        self.thread.start()
+        try:
+            self._load_cache()
+            if bootstrap_host:
+                self._remember_peer(
+                    bootstrap_host, time.monotonic() - self.PEER_TIMEOUT_SECONDS - 1
+                )
+        except (OSError, UnicodeError, ValueError) as error:
+            self.events.put(("error", "No se pudo cargar la libreta de pares: {}".format(error)))
+            return
+
+        targets = [
+            ("EvolutionPeerTcp", self._tcp_server),
+            ("EvolutionPeerLan", self._lan_discovery),
+            ("EvolutionPeerGossip", self._gossip_loop),
+        ]
+        self.threads = [
+            threading.Thread(target=target, name=name, daemon=True)
+            for name, target in targets
+        ]
+        for thread in self.threads:
+            thread.start()
+        self.events.put(("status", "started"))
 
     def stop(self):
         self.stop_event.set()
-        if self.socket:
+        for listener in self.sockets:
             try:
-                self.socket.close()
+                listener.close()
             except OSError:
                 pass
+        self.save_cache()
 
     def get_events(self):
         events = []
@@ -587,234 +522,250 @@ class LanPeerDiscovery:
             except queue.Empty:
                 return events
 
-    def _publish_count(self):
-        self.events.put(("count", len(self.peers)))
+    def set_paused(self, paused):
+        if paused:
+            self.paused_event.set()
+        else:
+            self.paused_event.clear()
 
-    def _run(self):
+    def peer_count(self):
+        now = time.monotonic()
+        with self.lock:
+            return sum(
+                1 for last_seen in self.peers.values()
+                if now - last_seen <= self.PEER_TIMEOUT_SECONDS
+            )
+
+    def _remember_peer(self, host, last_seen=None):
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as discovery_socket:
-                self.socket = discovery_socket
-                discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                discovery_socket.settimeout(0.5)
-                discovery_socket.bind(("", LAN_DISCOVERY_PORT))
-                payload = json.dumps(
-                    {
-                        "protocol": self.PROTOCOL_ID,
-                        "node_id": self.node_id,
-                    },
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                next_broadcast = 0.0
-                next_expiry = 0.0
-                self._publish_count()
+            host = validate_peer_address(host)
+        except ValueError:
+            return False
+        if host.lower() in ("localhost", socket.gethostname().lower()):
+            return False
+        now = time.monotonic() if last_seen is None else last_seen
+        with self.lock:
+            is_new = host not in self.peers
+            if is_new and len(self.peers) >= self.MAX_PEERS:
+                oldest = min(self.peers, key=self.peers.get)
+                del self.peers[oldest]
+            self.peers[host] = now
+        if is_new:
+            self.events.put(("peer", host))
+            self.events.put(("count", self.peer_count()))
+        return is_new
 
+    def _peer_snapshot(self):
+        with self.lock:
+            return list(self.peers.keys())[:self.MAX_PEERS]
+
+    def _load_cache(self):
+        if not self.cache_path.exists():
+            return
+        with self.cache_path.open("r", encoding="utf-8") as cache_file:
+            for index, line in enumerate(cache_file):
+                if index >= self.MAX_PEERS:
+                    break
+                host = line.strip()
+                if host:
+                    self._remember_peer(
+                        host, time.monotonic() - self.PEER_TIMEOUT_SECONDS - 1
+                    )
+
+    def save_cache(self):
+        with self.cache_lock:
+            peers = self._peer_snapshot()
+            if not peers:
+                return
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self.cache_path.with_name(self.cache_path.name + ".tmp")
+            with temp_path.open("w", encoding="utf-8", newline="\n") as cache_file:
+                cache_file.write("\n".join(peers) + "\n")
+            os.replace(str(temp_path), str(self.cache_path))
+
+    def _tcp_server(self):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+                self.sockets.append(server)
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server.settimeout(0.5)
+                server.bind(("", GLOBAL_BOOTSTRAP_PORT))
+                server.listen(32)
+                self.events.put(("listening", GLOBAL_BOOTSTRAP_PORT))
                 while not self.stop_event.is_set():
-                    now = time.monotonic()
-                    if now >= next_broadcast:
-                        discovery_socket.sendto(
-                            payload, ("255.255.255.255", LAN_DISCOVERY_PORT)
-                        )
-                        next_broadcast = now + LAN_DISCOVERY_INTERVAL_SECONDS
-
                     try:
-                        packet, address = discovery_socket.recvfrom(512)
+                        connection, address = server.accept()
                     except socket.timeout:
-                        packet = None
+                        continue
                     except OSError:
                         if self.stop_event.is_set():
                             break
                         raise
+                    if not self.connection_slots.acquire(blocking=False):
+                        connection.close()
+                        continue
 
-                    if packet:
+                    def handle_exchange(client=connection, peer=address[0]):
                         try:
-                            message = json.loads(packet.decode("utf-8"))
-                            peer_id = message.get("node_id")
-                            if (
-                                message.get("protocol") == self.PROTOCOL_ID
-                                and isinstance(peer_id, str)
-                                and peer_id != self.node_id
-                                and str(uuid.UUID(peer_id)) == peer_id
-                            ):
-                                now = time.monotonic()
-                                was_connected = peer_id in self.peers
-                                self.peers[peer_id] = (address[0], now)
-                                if peer_id not in self.seen_peers:
-                                    self.seen_peers.add(peer_id)
-                                    self.events.put(("peer", peer_id, address[0]))
-                                if not was_connected:
-                                    self._publish_count()
-                        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, ValueError):
-                            continue
+                            self._handle_exchange(client, peer)
+                        finally:
+                            self.connection_slots.release()
 
-                    if time.monotonic() >= next_expiry:
-                        current_time = time.monotonic()
-                        expired = [
-                            peer_id
-                            for peer_id, (_address, last_seen) in self.peers.items()
-                            if current_time - last_seen > LAN_PEER_TIMEOUT_SECONDS
-                        ]
-                        for peer_id in expired:
-                            del self.peers[peer_id]
-                        if expired:
-                            self._publish_count()
-                        next_expiry = current_time + 1
+                    handler = threading.Thread(
+                        target=handle_exchange,
+                        name="EvolutionPeerExchange",
+                        daemon=True,
+                    )
+                    handler.start()
         except OSError as error:
             if not self.stop_event.is_set():
-                self.events.put(("error", str(error)))
+                self.events.put(("error", "No se pudo escuchar TCP:{}: {}".format(
+                    GLOBAL_BOOTSTRAP_PORT, error
+                )))
         finally:
-            self.socket = None
-            self.events.put(("stopped",))
+            self.events.put(("count", self.peer_count()))
 
+    def _handle_exchange(self, connection, remote_host):
+        try:
+            with connection:
+                connection.settimeout(3)
+                data = self._receive_json_line(connection)
+                if not isinstance(data, dict) or data.get("protocol") != self.PROTOCOL_ID:
+                    return
+                if data.get("type") != "exchange" or data.get("node_id") == self.node_id:
+                    return
+                self._remember_peer(remote_host)
+                candidates = data.get("peers", [])
+                if isinstance(candidates, list):
+                    for host in candidates[:self.MAX_PEERS]:
+                        if isinstance(host, str):
+                            self._remember_peer(host)
+                response = {
+                    "protocol": self.PROTOCOL_ID,
+                    "type": "exchange",
+                    "node_id": self.node_id,
+                    "peers": self._peer_snapshot(),
+                }
+                connection.sendall(
+                    json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n"
+                )
+                self.events.put(("count", self.peer_count()))
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+            if not self.stop_event.is_set():
+                self.events.put(("peer_error", remote_host, str(error)))
 
-def build_login_view(root, on_login):
-    frame = ttk.Frame(root, padding=24)
-    frame.pack(fill=tk.BOTH, expand=True)
+    def _receive_json_line(self, connection):
+        data = bytearray()
+        while len(data) < self.MAX_MESSAGE_BYTES:
+            chunk = connection.recv(min(2048, self.MAX_MESSAGE_BYTES - len(data)))
+            if not chunk:
+                break
+            newline = chunk.find(b"\n")
+            if newline >= 0:
+                data.extend(chunk[:newline])
+                break
+            data.extend(chunk)
+        if not data or len(data) >= self.MAX_MESSAGE_BYTES:
+            raise ValueError("Mensaje P2P vacío o demasiado grande.")
+        return json.loads(data.decode("utf-8"))
 
-    ttk.Label(
-        frame,
-        text=APP_TITLE,
-        font=("Segoe UI", 16, "bold"),
-    ).pack(anchor=tk.W, pady=(0, 8))
-    ttk.Label(frame, text=APP_ATTRIBUTION, wraplength=430).pack(
-        anchor=tk.W, pady=(0, 10)
-    )
-    ttk.Label(
-        frame,
-        text="Elige un nombre para identificar este equipo en el registro local.",
-        wraplength=400,
-    ).pack(anchor=tk.W, pady=(0, 12))
-    ttk.Label(frame, text="Nombre de usuario").pack(anchor=tk.W)
-    username_var = tk.StringVar()
-    entry = ttk.Entry(frame, textvariable=username_var, width=42)
-    entry.pack(fill=tk.X, pady=(4, 12))
-    status = tk.StringVar(value="")
-    ttk.Label(frame, textvariable=status).pack(anchor=tk.W)
-
-    def submit(_event=None):
-        username = username_var.get().strip()
-        if not username:
-            status.set("Escribe un nombre para continuar.")
+    def _exchange_with_peer(self, host):
+        if self.stop_event.is_set() or self.paused_event.is_set():
             return
-        role = VOLUNTEER_ROLE
-        if username == CREATOR_USERNAME:
-            auth_path = get_creator_auth_path()
-            first_run = not auth_path.exists()
-            if first_run:
-                entered_seed = simpledialog.askstring(
-                    APP_TITLE,
-                    "Primera configuración: ingresa una semilla TOTP Base32 nueva "
-                    "de respaldo o déjala vacía para generar una. No reutilices "
-                    "semillas compartidas anteriormente.",
-                    parent=root,
+        try:
+            with socket.create_connection(
+                (host, GLOBAL_BOOTSTRAP_PORT), timeout=3
+            ) as connection:
+                connection.settimeout(3)
+                request = {
+                    "protocol": self.PROTOCOL_ID,
+                    "type": "exchange",
+                    "node_id": self.node_id,
+                    "peers": self._peer_snapshot(),
+                }
+                connection.sendall(
+                    json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
                 )
-                if entered_seed is None:
-                    return
+                response = self._receive_json_line(connection)
+            if (
+                not isinstance(response, dict)
+                or response.get("protocol") != self.PROTOCOL_ID
+                or response.get("type") != "exchange"
+            ):
+                raise ValueError("Respuesta de intercambio de pares no válida.")
+            self._remember_peer(host)
+            self.events.put(("count", self.peer_count()))
+            candidates = response.get("peers", [])
+            if isinstance(candidates, list):
+                for candidate in candidates[:self.MAX_PEERS]:
+                    if isinstance(candidate, str):
+                        self._remember_peer(candidate)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+            self.events.put(("peer_error", host, str(error)))
+
+    def _gossip_loop(self):
+        next_save = time.monotonic() + self.CACHE_INTERVAL_SECONDS
+        while not self.stop_event.wait(self.GOSSIP_INTERVAL_SECONDS):
+            if not self.paused_event.is_set():
+                all_peers = self._peer_snapshot()
+                peers = []
+                if all_peers:
+                    offset = self.gossip_offset % len(all_peers)
+                    peers = (all_peers[offset:] + all_peers[:offset])[:8]
+                    self.gossip_offset = (offset + len(peers)) % len(all_peers)
+                for host in peers:
+                    if self.stop_event.is_set() or self.paused_event.is_set():
+                        break
+                    self._exchange_with_peer(host)
+            cutoff = time.monotonic() - self.PEER_TIMEOUT_SECONDS
+            with self.lock:
+                active_count = sum(
+                    1 for last_seen in self.peers.values() if last_seen >= cutoff
+                )
+            self.events.put(("count", active_count))
+            if time.monotonic() >= next_save:
                 try:
-                    if entered_seed.strip():
-                        totp_secret, _ = decode_totp_secret(entered_seed)
-                        seed_generated = False
-                    else:
-                        totp_secret = generate_totp_secret()
-                        seed_generated = True
-                except (OSError, UnicodeError, ValueError, base64.binascii.Error) as error:
-                    messagebox.showerror(
-                        APP_TITLE,
-                        "No se pudo preparar la semilla TOTP:\n{}".format(error),
-                        parent=root,
-                    )
-                    return
+                    self.save_cache()
+                except OSError as error:
+                    self.events.put(("error", "No se pudo guardar la libreta de pares: {}".format(error)))
+                next_save = time.monotonic() + self.CACHE_INTERVAL_SECONDS
 
-                generated_password = secrets.token_urlsafe(24)
-                messagebox.showinfo(
-                    APP_TITLE,
-                    "Credenciales nuevas de creador. Guarda ambos valores ahora: "
-                    "la contraseña se mostrará una sola vez. Registra la semilla "
-                    "en tu app autenticadora.\n\nContraseña de creador:\n{}\n\n"
-                    "Semilla TOTP Base32{}:\n{}".format(
-                        generated_password,
-                        " nueva" if seed_generated else " importada",
-                        totp_secret,
-                    ),
-                    parent=root,
-                )
-                try:
-                    save_creator_auth(generated_password, totp_secret)
-                except (OSError, FileExistsError) as error:
-                    messagebox.showerror(
-                        APP_TITLE,
-                        "No se pudieron guardar las credenciales locales:\n{}"
-                        .format(error),
-                        parent=root,
-                    )
-                    return
-                password_for_verification = generated_password
-            else:
-                try:
-                    auth_data = load_creator_auth()
-                except (OSError, UnicodeError, ValueError, KeyError, TypeError) as error:
-                    messagebox.showerror(
-                        APP_TITLE,
-                        "No se pudo leer la configuración local del creador:\n{}"
-                        .format(error),
-                        parent=root,
-                    )
-                    return
-                totp_secret = auth_data["totp_secret"]
-                password_for_verification = None
-
-            entered_otp = simpledialog.askstring(
-                APP_TITLE,
-                "Paso 1: Ingrese el código dinámico de 6 dígitos de su App "
-                "Autenticadora.",
-                parent=root,
-            )
-            if entered_otp is None:
-                return
-            if not verify_totp(totp_secret, entered_otp):
-                messagebox.showerror(
-                    APP_TITLE, "El código TOTP no es válido.", parent=root
-                )
-                return
-
-            entered_secret = simpledialog.askstring(
-                APP_TITLE,
-                (
-                    "Paso 2: Confirma la contraseña de creador que se acaba de "
-                    "mostrar."
-                    if first_run
-                    else "Paso 2: Ingresa tu contraseña de creador."
-                ),
-                parent=root,
-                show="*",
-            )
-            if entered_secret is None:
-                return
-            if first_run:
-                password_valid = hmac.compare_digest(
-                    entered_secret, password_for_verification
-                )
-            else:
-                password_valid = verify_creator_password(entered_secret, auth_data)
-            if not password_valid:
-                messagebox.showerror(
-                    APP_TITLE, "La clave de creador no es válida.", parent=root
-                )
-                return
-            role = CREATOR_ROLE
-        on_login(username, role, frame)
-
-    buttons = ttk.Frame(frame)
-    buttons.pack(fill=tk.X)
-    ttk.Button(buttons, text="Continuar como voluntario", command=submit).pack(
-        side=tk.RIGHT
-    )
-    ttk.Button(buttons, text="Salir", command=root.destroy).pack(
-        side=tk.RIGHT, padx=(0, 8)
-    )
-    root.bind("<Return>", submit)
-    entry.focus_set()
-    return frame
+    def _lan_discovery(self):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as discovery:
+                self.sockets.append(discovery)
+                discovery.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                discovery.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                discovery.settimeout(0.5)
+                discovery.bind(("", LAN_DISCOVERY_PORT))
+                next_broadcast = 0.0
+                while not self.stop_event.is_set():
+                    now = time.monotonic()
+                    if not self.paused_event.is_set() and now >= next_broadcast:
+                        packet = json.dumps(
+                            {"protocol": self.PROTOCOL_ID, "node_id": self.node_id},
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        discovery.sendto(
+                            packet, ("255.255.255.255", LAN_DISCOVERY_PORT)
+                        )
+                        next_broadcast = now + LAN_DISCOVERY_INTERVAL_SECONDS
+                    try:
+                        packet, address = discovery.recvfrom(512)
+                    except socket.timeout:
+                        continue
+                    try:
+                        message = json.loads(packet.decode("utf-8"))
+                        if (
+                            message.get("protocol") == self.PROTOCOL_ID
+                            and message.get("node_id") != self.node_id
+                        ):
+                            self._remember_peer(address[0])
+                    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                        continue
+        except OSError as error:
+            if not self.stop_event.is_set():
+                self.events.put(("error", "No se pudo iniciar el descubrimiento LAN: {}".format(error)))
 
 
 def acquire_single_instance():
@@ -853,21 +804,18 @@ def release_single_instance(handle):
 
 
 class EvolutionNodeApp:
-    def __init__(self, root, username, role, record_store):
+    def __init__(self, root, record_store):
         self.root = root
-        self.username = username
-        self.role = role
         self.record_store = record_store
         self.closing = False
         self.flush_in_progress = False
-        self.discovery = None
-        self.discovery_poll_id = None
+        self.mesh = None
+        self.mesh_poll_id = None
         self.node_id = str(uuid.uuid4())
-        self.bootstrap_events = queue.Queue()
-        self.bootstrap_check_running = False
         self.cpu_monitor_stop = threading.Event()
         self.cpu_pause_event = threading.Event()
         self.cpu_pause_event.set()
+        self.cpu_monitor_available = False
         self.cpu_monitor_events = queue.Queue()
         self.cpu_monitor_poll_id = None
         self.root.title(APP_TITLE)
@@ -884,7 +832,7 @@ class EvolutionNodeApp:
         self.startup_var = tk.BooleanVar(value=self.startup_enabled)
         self.startup_status = tk.StringVar(
             value=(
-                "Se abrirá al iniciar sesión; el procesamiento requiere consentimiento manual."
+                "Evolution se abrirá al iniciar sesión en Windows."
                 if self.startup_enabled
                 else "Desactivado; no se iniciará automáticamente."
             )
@@ -892,7 +840,7 @@ class EvolutionNodeApp:
 
         self.task_running = False
         self.node_status = tk.StringVar(
-            value="Nodo local; la malla de procesamiento todavía no está conectada."
+            value="Nodo local; conexión P2P desactivada hasta que la habilites."
         )
         self.hardware_status = tk.StringVar(value="Detectando hardware...")
         self.operation_status = tk.StringVar(value="Listo")
@@ -934,9 +882,7 @@ class EvolutionNodeApp:
             container,
             text=APP_ATTRIBUTION,
         ).pack(anchor=tk.W, pady=(2, 4))
-        ttk.Label(container, text="Rango local: {}".format(self.role)).pack(
-            anchor=tk.W
-        )
+        ttk.Label(container, text="Nodo voluntario").pack(anchor=tk.W)
         ttk.Label(
             container,
             text=(
@@ -971,7 +917,7 @@ class EvolutionNodeApp:
         for column in range(3):
             options.columnconfigure(column, weight=1)
 
-        startup_options = ttk.LabelFrame(container, text="Inicio de sesión", padding=8)
+        startup_options = ttk.LabelFrame(container, text="Inicio de Windows", padding=8)
         startup_options.pack(fill=tk.X, pady=(0, 10))
         self.startup_check = ttk.Checkbutton(
             startup_options,
@@ -985,41 +931,46 @@ class EvolutionNodeApp:
         ).pack(anchor=tk.W, pady=(4, 0))
 
         self.mesh_controls = ttk.LabelFrame(
-            container, text="Participación en la malla", padding=10
+            container, text="Red P2P voluntaria", padding=10
         )
         self.mesh_controls.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(
             self.mesh_controls,
             text=(
-                "El descubrimiento UDP es solo para la LAN. El campo Bootstrap permite "
-                "resolver un dominio No-IP y probar TCP al puerto {}. La prueba solo "
-                "confirma que el puerto acepta conexiones: todavía no hay protocolo "
-                "global de registro, autenticación de pares ni ejecución de tareas."
+                "Al participar, este equipo intercambia direcciones de pares por TCP "
+                "en el puerto {} y anuncia descubrimiento en la LAN. El protocolo "
+                "intercambia solo identificadores y direcciones: no ejecuta trabajos "
+                "remotos. Para conexiones por Internet, configura el reenvío del "
+                "puerto TCP en el router y permite el puerto en el firewall."
             ).format(GLOBAL_BOOTSTRAP_PORT),
             wraplength=740,
         ).grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 8))
-        self.bootstrap_host_var = tk.StringVar()
-        ttk.Label(self.mesh_controls, text="Dominio No-IP del bootstrap:").grid(
+        self.mesh_host_var = tk.StringVar(value=MESH_BOOTSTRAP)
+        ttk.Label(self.mesh_controls, text="IP o dominio inicial (opcional):").grid(
             row=1, column=0, sticky=tk.W, padx=(0, 6), pady=4
         )
-        self.bootstrap_host_entry = ttk.Entry(
-            self.mesh_controls, textvariable=self.bootstrap_host_var
+        self.mesh_host_entry = ttk.Entry(
+            self.mesh_controls, textvariable=self.mesh_host_var
         )
-        self.bootstrap_host_entry.grid(
-            row=1, column=1, columnspan=2, sticky="ew", pady=4
-        )
-        self.bootstrap_button = ttk.Button(
+        self.mesh_host_entry.grid(row=1, column=1, columnspan=3, sticky="ew", pady=4)
+        self.mesh_enabled_var = tk.BooleanVar(value=False)
+        self.mesh_switch = ttk.Checkbutton(
             self.mesh_controls,
-            text="Probar conexión",
-            command=self._probe_global_bootstrap,
+            text="Activar Conexión en Red Solidaria",
+            variable=self.mesh_enabled_var,
+            command=self._toggle_mesh_connection,
         )
-        self.bootstrap_button.grid(row=1, column=3, sticky=tk.E, padx=(6, 0), pady=4)
-        self.bootstrap_status = tk.StringVar(value="Bootstrap global sin configurar.")
-        ttk.Label(
+        self.mesh_switch.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(4, 2))
+        self.mesh_status = tk.StringVar(value="Conexión en red desactivada.")
+        self.mesh_status_label = ttk.Label(
             self.mesh_controls,
-            textvariable=self.bootstrap_status,
+            textvariable=self.mesh_status,
             wraplength=740,
-        ).grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(2, 4))
+            foreground="#555555",
+        )
+        self.mesh_status_label.grid(
+            row=3, column=0, columnspan=4, sticky=tk.W, pady=(2, 4)
+        )
         self.cpu_status = tk.StringVar(value="Monitor de CPU iniciándose...")
         self.cpu_status_label = ttk.Label(
             self.mesh_controls,
@@ -1027,7 +978,7 @@ class EvolutionNodeApp:
             wraplength=740,
         )
         self.cpu_status_label.grid(
-            row=3, column=0, columnspan=4, sticky=tk.W, pady=(2, 4)
+            row=4, column=0, columnspan=4, sticky=tk.W, pady=(2, 4)
         )
         ttk.Label(
             self.mesh_controls,
@@ -1036,20 +987,7 @@ class EvolutionNodeApp:
                 "nodo; no comparte datos personales ni ejecuta tareas remotas."
             ),
             wraplength=740,
-        ).grid(row=4, column=0, columnspan=4, sticky=tk.W, pady=(4, 8))
-        self.mesh_status = tk.StringVar(value="Descubrimiento LAN detenido.")
-        self.mesh_status_label = ttk.Label(
-            self.mesh_controls, textvariable=self.mesh_status, foreground="#555555"
-        )
-        self.mesh_status_label.grid(
-            row=5, column=0, columnspan=4, sticky=tk.W, pady=(0, 4)
-        )
-        self.start_button = ttk.Button(
-            self.mesh_controls,
-            text="Iniciar descubrimiento LAN",
-            command=self._toggle_mesh_discovery,
-        )
-        self.start_button.grid(row=6, column=0, sticky=tk.W, pady=(8, 0))
+        ).grid(row=5, column=0, columnspan=4, sticky=tk.W, pady=(4, 8))
         self.mesh_controls.columnconfigure(1, weight=1)
 
         ttk.Label(container, text="Resultado de la última operación:").pack(anchor=tk.W)
@@ -1076,8 +1014,8 @@ class EvolutionNodeApp:
         if enabled and not messagebox.askyesno(
             APP_TITLE,
             "¿Permites que Evolution abra su ventana al iniciar sesión en Windows? "
-            "El procesamiento compartido seguirá desactivado hasta que lo habilites "
-            "manualmente. Puedes desactivar esta opción aquí en cualquier momento.",
+            "La conexión P2P seguirá desactivada hasta que la habilites en la "
+            "interfaz. Puedes desactivar esta opción aquí en cualquier momento.",
         ):
             self.startup_var.set(False)
             return
@@ -1105,7 +1043,7 @@ class EvolutionNodeApp:
 
         self.startup_enabled = enabled
         self.startup_status.set(
-            "Se abrirá al iniciar sesión; el procesamiento requiere consentimiento manual."
+            "Evolution se abrirá al iniciar sesión en Windows."
             if enabled
             else "Desactivado; no se iniciará automáticamente."
         )
@@ -1132,10 +1070,23 @@ class EvolutionNodeApp:
                 self.cpu_monitor_events.put(("error", str(error)))
                 return
 
+            self.cpu_monitor_available = True
             was_paused = None
             while not self.cpu_monitor_stop.is_set():
-                cpu_percent = psutil.cpu_percent(interval=0.5)
+                try:
+                    cpu_percent = psutil.cpu_percent(interval=0.5)
+                except (psutil.Error, OSError) as error:
+                    self.cpu_monitor_available = False
+                    self.cpu_pause_event.set()
+                    mesh = self.mesh
+                    if mesh is not None:
+                        mesh.set_paused(True)
+                    self.cpu_monitor_events.put(("error", str(error)))
+                    return
                 should_pause = cpu_percent > CPU_PAUSE_THRESHOLD_PERCENT
+                mesh = self.mesh
+                if mesh is not None:
+                    mesh.set_paused(should_pause)
                 if should_pause:
                     self.cpu_pause_event.set()
                 else:
@@ -1170,18 +1121,19 @@ class EvolutionNodeApp:
                 _kind, cpu_percent, should_pause = event
                 if should_pause:
                     self.cpu_status.set(
-                        "Pausa LOCAL: CPU {:.1f}% supera {:.0f}%. Solo afecta tareas "
-                        "de este equipo; los demás nodos siguen independientes. "
-                        "No hay trabajos distribuidos activos.".format(
+                        "Pausa LOCAL del intercambio P2P: CPU {:.1f}% supera {:.0f}%. "
+                        "Se detiene el gossip saliente de este equipo; otros nodos "
+                        "siguen independientes. No hay tareas remotas ejecutándose."
+                        .format(
                             cpu_percent, CPU_PAUSE_THRESHOLD_PERCENT
                         )
                     )
                     self.cpu_status_label.configure(foreground="#b42318")
                 else:
                     self.cpu_status.set(
-                        "CPU local {:.1f}%: bajo el umbral de {:.0f}%. La señal de "
-                        "pausa local está liberada; no hay trabajos distribuidos "
-                        "activos.".format(
+                        "CPU local {:.1f}%: bajo el umbral de {:.0f}%. El intercambio "
+                        "P2P saliente puede continuar; no hay tareas remotas "
+                        "ejecutándose.".format(
                             cpu_percent, CPU_PAUSE_THRESHOLD_PERCENT
                         )
                     )
@@ -1191,84 +1143,10 @@ class EvolutionNodeApp:
                     "Monitor de CPU no disponible: {}".format(event[1])
                 )
 
-        while True:
-            try:
-                event = self.bootstrap_events.get_nowait()
-            except queue.Empty:
-                break
-            self.bootstrap_check_running = False
-            if event[0] == "reachable":
-                _kind, host, address = event
-                self.bootstrap_status.set(
-                    "El endpoint {} ({}) acepta TCP en el puerto {}. Esto no "
-                    "confirma que exista una malla o un protocolo P2P.".format(
-                        host, address, GLOBAL_BOOTSTRAP_PORT
-                    )
-                )
-                self.bootstrap_button.configure(state=tk.NORMAL)
-                self._set_output(
-                    "Prueba TCP completada: {}:{} respondió aceptando la conexión. "
-                    "No se intercambiaron tareas ni se registró el nodo en una red."
-                    .format(address, GLOBAL_BOOTSTRAP_PORT)
-                )
-            elif event[0] == "error":
-                _kind, host, error = event
-                self.bootstrap_status.set(
-                    "No se pudo conectar a {}:{}.".format(
-                        host, GLOBAL_BOOTSTRAP_PORT
-                    )
-                )
-                self.bootstrap_button.configure(state=tk.NORMAL)
-                self._set_output(
-                    "Falló la prueba de bootstrap para {}:{}: {}".format(
-                        host, GLOBAL_BOOTSTRAP_PORT, error
-                    )
-                )
-
         if not self.closing:
             self.cpu_monitor_poll_id = self.root.after(
                 500, self._poll_background_status
             )
-
-    def _probe_global_bootstrap(self):
-        if self.bootstrap_check_running:
-            return
-        host = self.bootstrap_host_var.get().strip()
-        if not host or any(character.isspace() for character in host):
-            messagebox.showwarning(
-                APP_TITLE,
-                "Escribe un dominio No-IP o nombre DNS válido.",
-                parent=self.root,
-            )
-            return
-        if not messagebox.askyesno(
-            APP_TITLE,
-            "Se resolverá {} mediante DNS y se intentará una conexión TCP al puerto "
-            "{}. Se contactará el endpoint que ingresaste; no se enviarán tareas ni "
-            "credenciales. ¿Continuar?".format(host, GLOBAL_BOOTSTRAP_PORT),
-            parent=self.root,
-        ):
-            return
-
-        self.bootstrap_check_running = True
-        self.bootstrap_button.configure(state=tk.DISABLED)
-        self.bootstrap_status.set(
-            "Resolviendo {} y probando TCP:{}...".format(
-                host, GLOBAL_BOOTSTRAP_PORT
-            )
-        )
-
-        def probe():
-            try:
-                address = probe_global_bootstrap(host)
-            except (OSError, UnicodeError) as error:
-                self.bootstrap_events.put(("error", host, str(error)))
-            else:
-                self.bootstrap_events.put(("reachable", host, address))
-
-        threading.Thread(
-            target=probe, name="EvolutionBootstrapProbe", daemon=True
-        ).start()
 
     def _set_output(self, text):
         self.output.configure(state=tk.NORMAL)
@@ -1507,14 +1385,14 @@ class EvolutionNodeApp:
                 "Auditoría local\n"
                 "Procesadores lógicos: {}\nRAM total: {}\nRAM disponible: {}\n"
                 "Registros locales visibles: {}\n"
-                "Los peers detectados por LAN: {}; las pruebas bootstrap solo "
-                "confirman conectividad TCP, no una malla autenticada."
+                "Pares P2P descubiertos: {}. El protocolo actual solo intercambia "
+                "direcciones; no distribuye ni ejecuta tareas."
             ).format(
                 logical_cpus,
                 format_bytes(total_ram),
                 format_bytes(available_ram),
                 record_count,
-                len(self.discovery.peers) if self.discovery else 0,
+                self.mesh.peer_count() if self.mesh else 0,
             )
 
         self._run_async("Auditando el nodo local...", audit)
@@ -1522,82 +1400,132 @@ class EvolutionNodeApp:
     def _show_mesh_controls(self):
         self.mesh_controls.focus_set()
         self._set_output(
-            "Control de participación\n"
-            "La prueba Bootstrap resuelve el nombre ingresado y verifica una conexión "
-            "TCP al puerto 50001. No registra peers ni confirma una malla global, ya "
-            "que falta un servicio bootstrap con protocolo autenticado. El descubrimiento "
-            "UDP sigue limitado a la LAN. No se reciben ni ejecutan trabajos remotos."
+            "Red P2P voluntaria\n"
+            "Este prototipo comparte direcciones de pares mediante TCP y anuncios "
+            "UDP en la LAN. Solo comparte identificadores y direcciones; todavía "
+            "no distribuye cálculos ni ejecuta código remoto. Para aceptar conexiones "
+            "desde Internet, abre TCP:{} en el firewall y reenvíalo en el router."
+            .format(GLOBAL_BOOTSTRAP_PORT)
         )
 
-    def _toggle_mesh_discovery(self):
-        if self.discovery:
-            self.discovery.stop()
-            self.discovery = None
-            if self.discovery_poll_id is not None:
-                self.root.after_cancel(self.discovery_poll_id)
-                self.discovery_poll_id = None
-            self.start_button.configure(text="Iniciar descubrimiento LAN")
-            self.mesh_status.set("Descubrimiento LAN detenido.")
+    def _toggle_mesh_connection(self):
+        if not self.mesh_enabled_var.get():
+            mesh = self.mesh
+            self.mesh = None
+            if mesh:
+                try:
+                    mesh.stop()
+                except OSError as error:
+                    messagebox.showerror(
+                        APP_TITLE,
+                        "No se pudo guardar la libreta de pares:\n{}".format(error),
+                        parent=self.root,
+                    )
+            if self.mesh_poll_id is not None:
+                self.root.after_cancel(self.mesh_poll_id)
+                self.mesh_poll_id = None
+            self.mesh_status.set("Conexión en red desactivada.")
             self.mesh_status_label.configure(foreground="#555555")
-            self._set_output("Se detuvo el descubrimiento de nodos en la red local.")
+            self.mesh_host_entry.configure(state=tk.NORMAL)
+            self._set_output("Este nodo dejó de participar en el intercambio P2P.")
             return
 
         if not messagebox.askyesno(
             APP_TITLE,
-            "Evolution enviará y escuchará anuncios UDP de descubrimiento en la red "
-            "local por el puerto {}. Los anuncios contienen solo un identificador "
-            "aleatorio del nodo; no transportan tareas ni datos personales. "
-            "¿Permitir el descubrimiento LAN?".format(LAN_DISCOVERY_PORT),
+            "Al activar la red, este equipo escuchará conexiones P2P entrantes en "
+            "TCP:{} y anunciará un identificador aleatorio por UDP en la LAN. "
+            "Compartirá direcciones IP/dominios de pares, no tareas ni datos personales. "
+            "¿Activar la conexión?".format(
+                GLOBAL_BOOTSTRAP_PORT
+            ),
             parent=self.root,
         ):
+            self.mesh_enabled_var.set(False)
+            return
+        if not self.cpu_monitor_available:
+            messagebox.showerror(
+                APP_TITLE,
+                "No se activará la red: el monitor psutil no está disponible. "
+                "Instala psutil para habilitar el freno local de CPU.",
+                parent=self.root,
+            )
+            self.mesh_enabled_var.set(False)
             return
 
-        self.discovery = LanPeerDiscovery(self.node_id)
-        self.discovery.start()
-        self.start_button.configure(text="Detener descubrimiento LAN")
-        self.mesh_status.set("Descubrimiento LAN activo; buscando otros nodos...")
+        host = self.mesh_host_var.get().strip()
+        if host:
+            try:
+                host = validate_peer_address(host)
+            except ValueError as error:
+                messagebox.showwarning(APP_TITLE, str(error), parent=self.root)
+                self.mesh_enabled_var.set(False)
+                return
+        try:
+            cache_path = get_mesh_cache_path()
+        except OSError as error:
+            messagebox.showerror(
+                APP_TITLE,
+                "No se pudo preparar la libreta local de pares:\n{}".format(error),
+                parent=self.root,
+            )
+            self.mesh_enabled_var.set(False)
+            return
+        self.mesh = P2PPeerMesh(self.node_id, cache_path)
+        self.mesh.start(host)
+        self.mesh.set_paused(self.cpu_pause_event.is_set())
+        self.mesh_host_entry.configure(state=tk.DISABLED)
+        self.mesh_status.set(
+            "P2P activado; conectando y buscando pares conocidos. "
+            "No se ejecutan tareas remotas."
+        )
         self.mesh_status_label.configure(foreground="#9a6700")
         self._set_output(
-            "Buscando otros nodos Evolution en la red local. Solo se anuncia un "
-            "identificador aleatorio; no se aceptan ni ejecutan trabajos remotos."
+            "P2P voluntario activo. Intentando intercambio TCP con pares guardados "
+            "y descubrimiento UDP en la LAN. No se envían ni ejecutan tareas."
         )
         self._poll_mesh_discovery()
 
     def _poll_mesh_discovery(self):
-        self.discovery_poll_id = None
-        discovery = self.discovery
-        if discovery is None or self.closing:
+        self.mesh_poll_id = None
+        mesh = self.mesh
+        if mesh is None or self.closing:
             return
 
-        for event in discovery.get_events():
+        for event in mesh.get_events():
             event_type = event[0]
             if event_type == "count":
                 peer_count = event[1]
-                self.mesh_status.set(
-                    "Malla P2P LAN activa: {} nodos anunciados (incluye este equipo); "
-                    "sin ejecución de tareas remotas.".format(peer_count + 1)
-                )
+                if peer_count:
+                    self.mesh_status.set(
+                        "Malla P2P Activa: {} Nodos Descubiertos en el Enjambre"
+                        .format(peer_count)
+                    )
+                else:
+                    self.mesh_status.set(
+                        "P2P activo; buscando pares. No se ejecutan tareas remotas."
+                    )
                 self.mesh_status_label.configure(
-                    foreground="#16803c" if peer_count else "#9a6700"
+                    foreground="#00a83b" if peer_count else "#9a6700"
                 )
-            elif event_type == "peer":
-                _event_type, peer_id, _address = event
-                self.record_store.add_peer(peer_id)
-            elif event_type == "error":
-                self.discovery = None
-                self.start_button.configure(text="Iniciar descubrimiento LAN")
-                self.mesh_status.set("No se pudo iniciar el descubrimiento LAN.")
-                self.mesh_status_label.configure(foreground="#b42318")
+            elif event_type == "listening":
                 self._set_output(
-                    "Error de descubrimiento UDP: {}\nComprueba que el puerto {} "
-                    "esté disponible y permitido en la red.".format(
-                        event[1], LAN_DISCOVERY_PORT
+                    "Escuchando conexiones P2P TCP en el puerto {}.".format(event[1])
+                )
+            elif event_type == "error":
+                self.mesh_status.set(event[1])
+                self.mesh_status_label.configure(foreground="#b42318")
+                messagebox.showerror(APP_TITLE, event[1], parent=self.root)
+            elif event_type == "peer":
+                self.record_store.add_peer(event[1])
+            elif event_type == "peer_error":
+                self.operation_status.set(
+                    "No se pudo intercambiar pares con {}: {}".format(
+                        event[1], event[2]
                     )
                 )
-                return
 
-        if self.discovery is discovery:
-            self.discovery_poll_id = self.root.after(
+        if self.mesh is mesh:
+            self.mesh_poll_id = self.root.after(
                 500, self._poll_mesh_discovery
             )
 
@@ -1661,6 +1589,9 @@ class EvolutionNodeApp:
         def flush():
             try:
                 self.record_store.flush()
+                mesh = self.mesh
+                if mesh is not None:
+                    mesh.save_cache()
             except OSError as error:
                 self.root.after(0, lambda error=error: finish(error))
             else:
@@ -1695,12 +1626,22 @@ class EvolutionNodeApp:
         if self.cpu_monitor_poll_id is not None:
             self.root.after_cancel(self.cpu_monitor_poll_id)
             self.cpu_monitor_poll_id = None
-        if self.discovery:
-            self.discovery.stop()
-            self.discovery = None
-        if self.discovery_poll_id is not None:
-            self.root.after_cancel(self.discovery_poll_id)
-            self.discovery_poll_id = None
+        if self.mesh:
+            try:
+                self.mesh.stop()
+            except OSError as error:
+                self.closing = False
+                messagebox.showerror(
+                    APP_TITLE,
+                    "No se pudo guardar la libreta de pares; el nodo permanece "
+                    "abierto:\n{}".format(error),
+                    parent=self.root,
+                )
+                return
+            self.mesh = None
+        if self.mesh_poll_id is not None:
+            self.root.after_cancel(self.mesh_poll_id)
+            self.mesh_poll_id = None
         self.node_status.set("Guardando registro local antes de salir...")
         self._flush_records_async(on_complete=self._finish_close)
 
@@ -1726,37 +1667,19 @@ def main():
         return
 
     root = tk.Tk()
-    root.title(APP_TITLE)
-    root.geometry("480x280")
-    root.minsize(420, 260)
-    root.resizable(False, False)
-
-    def activate_node(username, role, login_frame):
-        try:
-            record_store = LocalRecordStore(get_log_path())
-            record_store.add(username)
-        except OSError as error:
-            messagebox.showerror(APP_TITLE, str(error), parent=root)
-            return
-
-        login_frame.destroy()
-        try:
-            EvolutionNodeApp(root, username, role, record_store)
-        except Exception as error:
-            messagebox.showerror(
-                APP_TITLE,
-                "No se pudo inicializar la ventana principal:\n{}".format(error),
-                parent=root,
-            )
-            build_login_view(root, activate_node)
-            root.deiconify()
-            root.lift()
-            return
-        root.deiconify()
-        root.lift()
-        root.focus_force()
-
-    build_login_view(root, activate_node)
+    try:
+        record_store = LocalRecordStore(get_log_path())
+        record_store.add("Nodo voluntario", VOLUNTEER_ROLE)
+        EvolutionNodeApp(root, record_store)
+    except (OSError, RuntimeError, ValueError) as error:
+        messagebox.showerror(
+            APP_TITLE,
+            "No se pudo inicializar la aplicación:\n{}".format(error),
+            parent=root,
+        )
+        root.destroy()
+        release_single_instance(instance_handle)
+        return
     root.deiconify()
     root.lift()
     root.update_idletasks()
