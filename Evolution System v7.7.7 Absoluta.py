@@ -1,19 +1,36 @@
 import ctypes
+import base64
 import gc
+import hashlib
+import hmac
+import ipaddress
 import json
+import multiprocessing
 import os
 import platform
 import queue
 import socket
+import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
 import uuid
-from datetime import datetime
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
+from urllib.parse import urljoin, urlsplit
+
+from cryptography import x509
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 
 APP_TITLE = "Evolution System - Versión 7.7.7 Absoluta"
@@ -26,9 +43,15 @@ LAN_DISCOVERY_INTERVAL_SECONDS = 2
 LAN_PEER_TIMEOUT_SECONDS = 8
 GLOBAL_BOOTSTRAP_PORT = 50001
 CPU_PAUSE_THRESHOLD_PERCENT = 95.0
-VOLUNTEER_ROLE = "Nodo Secundario / Voluntario"
+VOLUNTEER_ROLE = "Rol del Nodo: NODO PRINCIPAL / COOPERANTE"
 MESH_BOOTSTRAP = ""
-MESH_CACHE_FILENAME = "evolution_peers.txt"
+MESH_CACHE_FILENAME = "nodos_red.txt"
+MESH_KEY_FILENAME = "nodos_red.key"
+TLS_CERT_FILENAME = "nodo_tls.crt"
+TLS_KEY_FILENAME = "nodo_tls.key"
+APP_CONFIG_DIRECTORY = "evolution-system-v777"
+MAX_MATH_MATRIX_DIMENSION = 32
+MATH_TASK_COOLDOWN_SECONDS = 0.05
 APP_ATTRIBUTION = (
     "Creado por Juan Camilo Mazo González (jcmgru) | ProyectosGeniales | "
     "jcmgru7@gmail.com"
@@ -48,7 +71,382 @@ def get_windows_folder(csidl):
 
 
 def get_mesh_cache_path():
-    return get_log_path().parent / MESH_CACHE_FILENAME
+    if getattr(sys, "frozen", False):
+        app_directory = Path(sys.executable).resolve().parent
+    else:
+        app_directory = Path(__file__).resolve().parent
+    return app_directory / MESH_CACHE_FILENAME
+
+
+def get_app_config_path():
+    if platform.system().lower() == "windows":
+        root = os.environ.get("LOCALAPPDATA")
+        if not root:
+            raise OSError("Windows no definió LOCALAPPDATA para guardar las claves.")
+        base = Path(root)
+    else:
+        root = os.environ.get("XDG_CONFIG_HOME")
+        base = Path(root) if root else Path.home() / ".config"
+    config_path = base / APP_CONFIG_DIRECTORY
+    config_path.mkdir(parents=True, exist_ok=True)
+    try:
+        config_path.chmod(0o700)
+    except OSError:
+        if platform.system().lower() != "windows":
+            raise
+    return config_path
+
+
+def _write_private_file(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(
+        str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+    )
+    with os.fdopen(descriptor, "wb") as output:
+        output.write(data)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        if platform.system().lower() != "windows":
+            raise
+
+
+def _load_or_create_secret(path, create):
+    path = Path(path)
+    if path.exists():
+        secret = path.read_bytes()
+        if not secret:
+            raise ValueError("El archivo de clave local está vacío: {}".format(path))
+        return secret
+    if not create:
+        raise FileNotFoundError("No se encontró la clave local: {}".format(path))
+    secret = Fernet.generate_key()
+    _write_private_file(path, secret)
+    return secret
+
+
+def _create_tls_identity(config_path):
+    config_path = Path(config_path)
+    cert_path = config_path / TLS_CERT_FILENAME
+    key_path = config_path / TLS_KEY_FILENAME
+    if cert_path.exists() and key_path.exists():
+        return cert_path, key_path
+    if cert_path.exists() != key_path.exists():
+        raise OSError("La identidad TLS local está incompleta; no se regeneró.")
+
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    subject = issuer = x509.Name(
+        [x509.NameAttribute(NameOID.COMMON_NAME, "Evolution P2P node")]
+    )
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=3650))
+        .add_extension(
+            x509.BasicConstraints(ca=False, path_length=None),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage(
+                [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH]
+            ),
+            critical=False,
+        )
+        .sign(private_key, hashes.SHA256())
+    )
+    key_bytes = private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    cert_bytes = certificate.public_bytes(serialization.Encoding.PEM)
+    _write_private_file(key_path, key_bytes)
+    try:
+        _write_private_file(cert_path, cert_bytes)
+    except OSError:
+        key_path.unlink(missing_ok=True)
+        raise
+    return cert_path, key_path
+
+
+def create_tls_contexts(config_path):
+    cert_path, key_path = _create_tls_identity(config_path)
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.minimum_version = ssl.TLSVersion.TLSv1_2
+    server_context.load_cert_chain(str(cert_path), str(key_path))
+    client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    client_context.minimum_version = ssl.TLSVersion.TLSv1_2
+    client_context.check_hostname = False
+    client_context.verify_mode = ssl.CERT_NONE
+    return server_context, client_context
+
+
+def read_protected_peer_cache(path):
+    path = Path(path)
+    if not path.exists():
+        return {"peers": [], "fingerprints": {}}
+    config_path = get_app_config_path()
+    key = _load_or_create_secret(config_path / MESH_KEY_FILENAME, create=False)
+    return load_protected_peer_cache(path, Fernet(key))
+
+
+def load_protected_peer_cache(path, fernet):
+    path = Path(path)
+    if not path.exists():
+        return {"peers": [], "fingerprints": {}}
+    with path.open("r", encoding="utf-8") as cache_file:
+        envelope = json.load(cache_file)
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("version") != 2
+        or envelope.get("protection") != "fernet"
+        or not isinstance(envelope.get("data"), str)
+    ):
+        raise ValueError(
+            "Formato de libreta no reconocido. El archivo previo estaba protegido "
+            "con un formato heredado que no puede migrarse automáticamente."
+        )
+    try:
+        encrypted = base64.b64decode(envelope["data"], validate=True)
+        payload = json.loads(fernet.decrypt(encrypted).decode("utf-8"))
+    except (ValueError, UnicodeError, InvalidToken) as error:
+        raise ValueError(
+            "No se pudo autenticar la libreta. Verifica la clave local y el archivo."
+        ) from error
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("peers"), list)
+        or not isinstance(payload.get("fingerprints"), dict)
+    ):
+        raise ValueError("Contenido descifrado de libreta no válido.")
+    return {
+        "peers": [
+            host for host in payload["peers"][:128] if isinstance(host, str)
+        ],
+        "fingerprints": {
+            host: value
+            for host, value in list(payload["fingerprints"].items())[:128]
+            if isinstance(host, str)
+            and isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value.lower())
+        },
+    }
+
+
+def _upnp_soap_request(endpoint, service_type, action, arguments):
+    fields = "".join(
+        "<{0}>{1}</{0}>".format(name, value) for name, value in arguments.items()
+    )
+    body = (
+        '<?xml version="1.0"?>'
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+        "<s:Body><u:{0} xmlns:u=\"{1}\">{2}</u:{0}></s:Body></s:Envelope>"
+    ).format(action, service_type, fields).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPAction": '"{}#{}"'.format(service_type, action),
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=2) as response:
+        return response.read(64 * 1024).decode("utf-8", errors="replace")
+
+
+def add_upnp_tcp_mapping(port):
+    discovery = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    discovery.settimeout(1)
+    search = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        "HOST: 239.255.255.250:1900\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        "MX: 1\r\n"
+        'ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n'
+    ).encode("ascii")
+    try:
+        discovery.sendto(search, ("239.255.255.250", 1900))
+        response, _address = discovery.recvfrom(8192)
+    finally:
+        discovery.close()
+    headers = {}
+    for line in response.decode("iso-8859-1").splitlines():
+        if ":" in line:
+            name, value = line.split(":", 1)
+            headers[name.strip().lower()] = value.strip()
+    location = headers.get("location")
+    if not location:
+        raise OSError("El gateway UPnP no anunció una URL de dispositivo.")
+    location_parts = urlsplit(location)
+    if location_parts.scheme != "http" or not location_parts.hostname:
+        raise OSError("La URL UPnP debe ser HTTP y apuntar a una IP del gateway.")
+    try:
+        gateway_address = ipaddress.ip_address(location_parts.hostname)
+    except ValueError as error:
+        raise OSError("La URL UPnP no contiene una IP local verificable.") from error
+    if not gateway_address.is_private or gateway_address.is_loopback:
+        raise OSError("Se rechazó una URL UPnP fuera de la red privada local.")
+    with urllib.request.urlopen(location, timeout=3) as response:
+        description = ET.fromstring(response.read(256 * 1024))
+    base_url = location
+    for element in description.iter():
+        if element.tag.rsplit("}", 1)[-1] == "URLBase" and element.text:
+            base_url = element.text.strip()
+            break
+    base_parts = urlsplit(base_url)
+    if (
+        base_parts.scheme != "http"
+        or base_parts.hostname != location_parts.hostname
+    ):
+        raise OSError("El gateway UPnP anunció una URL de control no local.")
+    service = None
+    for candidate in description.iter():
+        if candidate.tag.rsplit("}", 1)[-1] != "service":
+            continue
+        fields = {
+            child.tag.rsplit("}", 1)[-1]: child.text or ""
+            for child in candidate
+        }
+        service_type = fields.get("serviceType", "")
+        known_service = any(
+            service_type.startswith(prefix)
+            for prefix in (
+                "urn:schemas-upnp-org:service:WANIPConnection:",
+                "urn:schemas-upnp-org:service:WANPPPConnection:",
+            )
+        )
+        version = service_type.rsplit(":", 1)[-1]
+        if known_service and version.isdigit() and fields.get("controlURL"):
+            service = (service_type, fields.get("controlURL"))
+            break
+    if not service or not service[1]:
+        raise OSError("El gateway no expone WANIPConnection/WANPPPConnection.")
+    service_type, control_path = service
+    endpoint = urljoin(base_url, control_path)
+    endpoint_parts = urlsplit(endpoint)
+    if (
+        endpoint_parts.scheme != "http"
+        or endpoint_parts.hostname != location_parts.hostname
+    ):
+        raise OSError("El endpoint UPnP no pertenece al gateway local descubierto.")
+    route_probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        route_probe.connect(("198.51.100.1", 9))
+        internal_address = route_probe.getsockname()[0]
+    finally:
+        route_probe.close()
+    _upnp_soap_request(
+        endpoint,
+        service_type,
+        "AddPortMapping",
+        {
+            "NewRemoteHost": "",
+            "NewExternalPort": str(port),
+            "NewProtocol": "TCP",
+            "NewInternalPort": str(port),
+            "NewInternalClient": internal_address,
+            "NewEnabled": "1",
+            "NewPortMappingDescription": "Evolution System P2P",
+            "NewLeaseDuration": "1800",
+        },
+    )
+    return endpoint, service_type, internal_address
+
+
+def get_public_ip():
+    request = urllib.request.Request(
+        "https://api.ipify.org", headers={"User-Agent": "EvolutionSystem/7.7.7"}
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        address = response.read(64).decode("ascii").strip()
+    return str(ipaddress.ip_address(address))
+
+
+def calculate_math_task(task, pause_event=None, stop_event=None):
+    if not isinstance(task, dict):
+        raise ValueError("La micro-tarea debe ser un objeto JSON.")
+    task_type = task.get("task_type")
+    if task_type == "matrix_add":
+        left = task.get("left")
+        right = task.get("right")
+        if not isinstance(left, list) or not isinstance(right, list):
+            raise ValueError("matrix_add requiere las matrices left y right.")
+        if not left or len(left) > MAX_MATH_MATRIX_DIMENSION:
+            raise ValueError("Dimensiones de matriz fuera del límite permitido.")
+        if len(left) != len(right):
+            raise ValueError("Las matrices deben tener el mismo número de filas.")
+        if (
+            not isinstance(left[0], list)
+            or not isinstance(right[0], list)
+            or not left[0]
+            or len(left[0]) > MAX_MATH_MATRIX_DIMENSION
+        ):
+            raise ValueError("Dimensiones de matriz fuera del límite permitido.")
+        columns = len(left[0])
+        result = []
+        for left_row, right_row in zip(left, right):
+            if pause_event is not None and pause_event.is_set():
+                raise InterruptedError("La micro-tarea se pausó por carga local alta.")
+            if stop_event is not None and stop_event.is_set():
+                raise InterruptedError("La participación P2P fue desactivada.")
+            if (
+                not isinstance(left_row, list)
+                or not isinstance(right_row, list)
+                or len(left_row) != columns
+                or len(left_row) != len(right_row)
+            ):
+                raise ValueError("Filas de matriz no válidas.")
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or abs(value) > 1_000_000
+                for value in left_row + right_row
+            ):
+                raise ValueError("Solo se admiten enteros acotados.")
+            result.append([a + b for a, b in zip(left_row, right_row)])
+        return {"task_type": task_type, "result": result}
+    if task_type == "sum_range":
+        start = task.get("start")
+        end = task.get("end")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or start < 0
+            or end > 1_000_000_000
+            or end < start
+            or end - start > 100_000
+        ):
+            raise ValueError("Rango de suma fuera del límite permitido.")
+        total = 0
+        for value in range(start, end + 1):
+            if value % 1024 == 0:
+                if pause_event is not None and pause_event.is_set():
+                    raise InterruptedError("La micro-tarea se pausó por carga local alta.")
+                if stop_event is not None and stop_event.is_set():
+                    raise InterruptedError("La participación P2P fue desactivada.")
+            total += value
+        return {"task_type": task_type, "result": total}
+    raise ValueError("Tipo de micro-tarea no admitido.")
+
+
+def is_windows_admin():
+    system = platform.system().lower()
+    if system == "windows":
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    if hasattr(os, "geteuid"):
+        return os.geteuid() == 0
+    return False
 
 
 def validate_peer_address(host):
@@ -346,7 +744,10 @@ def get_log_path():
 
 
 def get_hardware_info():
-    logical_cpus = os.cpu_count() or 1
+    try:
+        logical_cpus = multiprocessing.cpu_count()
+    except NotImplementedError:
+        logical_cpus = os.cpu_count() or 1
     system = platform.system().lower()
 
     if system == "windows":
@@ -389,28 +790,40 @@ def format_bytes(value):
     return "{:.1f} GiB".format(value / (1024 ** 3))
 
 
-def remove_expired_temp_data(path, cutoff):
-    file_attributes = getattr(path.lstat(), "st_file_attributes", 0)
-    if path.is_symlink() or file_attributes & 0x400:
-        return 0
-
-    if path.is_file():
-        if path.stat().st_mtime >= cutoff:
-            return 0
-        path.unlink()
-        return 1
-
-    if not path.is_dir():
-        return 0
+def clear_temp_directory(path):
+    path = Path(path)
+    if not path.is_dir() or path.is_symlink():
+        raise OSError("La ruta temporal no es una carpeta accesible: {}".format(path))
+    if getattr(path.lstat(), "st_file_attributes", 0) & 0x400:
+        raise OSError("Se rechazó una ruta temporal marcada como reparse point.")
 
     removed = 0
-    for child in path.iterdir():
-        removed += remove_expired_temp_data(child, cutoff)
+    skipped = []
 
-    if path.stat().st_mtime < cutoff and not any(path.iterdir()):
-        path.rmdir()
-        removed += 1
-    return removed
+    def remove_item(item):
+        nonlocal removed
+        try:
+            attributes = getattr(item.lstat(), "st_file_attributes", 0)
+            if item.is_symlink() or attributes & 0x400:
+                skipped.append("{}: enlace o punto de reanálisis omitido".format(item))
+                return
+            if item.is_dir():
+                for child in item.iterdir():
+                    remove_item(child)
+                try:
+                    item.rmdir()
+                    removed += 1
+                except OSError as error:
+                    skipped.append("{}: {}".format(item, error))
+            elif item.is_file():
+                item.unlink()
+                removed += 1
+        except OSError as error:
+            skipped.append("{}: {}".format(item, error))
+
+    for child in path.iterdir():
+        remove_item(child)
+    return removed, skipped
 
 
 def format_local_record(username, role=VOLUNTEER_ROLE):
@@ -429,12 +842,6 @@ class LocalRecordStore:
     def add(self, username, role=VOLUNTEER_ROLE):
         with self.lock:
             self.pending_records.append(format_local_record(username, role))
-
-    def add_peer(self, peer_id):
-        with self.lock:
-            self.pending_records.append(
-                format_local_record("peer:" + peer_id, "nodo_p2p_detectado")
-            )
 
     def read(self):
         with self.lock:
@@ -457,7 +864,7 @@ class LocalRecordStore:
 
 
 class P2PPeerMesh:
-    PROTOCOL_ID = "evolution-peer-exchange-v1"
+    PROTOCOL_ID = "evolution-peer-exchange-v2-tls"
     MAX_PEERS = 128
     MAX_MESSAGE_BYTES = 64 * 1024
     PEER_TIMEOUT_SECONDS = 30 * 60
@@ -467,22 +874,37 @@ class P2PPeerMesh:
     def __init__(self, node_id, cache_path):
         self.node_id = node_id
         self.cache_path = cache_path
+        self.config_path = None
+        self.fernet = None
+        self.server_ssl_context = None
+        self.client_ssl_context = None
         self.events = queue.Queue()
         self.stop_event = threading.Event()
         self.paused_event = threading.Event()
         self.lock = threading.Lock()
         self.cache_lock = threading.Lock()
         self.connection_slots = threading.BoundedSemaphore(16)
+        self.task_slots = threading.BoundedSemaphore(1)
         self.peers = {}
+        self.peer_fingerprints = {}
         self.sockets = []
         self.threads = []
         self.gossip_offset = 0
+        self.processed_task_count = 0
 
     def start(self, bootstrap_host=""):
         if any(thread.is_alive() for thread in self.threads):
-            return
+            return True
         self.stop_event.clear()
         try:
+            self.config_path = get_app_config_path()
+            key = _load_or_create_secret(
+                self.config_path / MESH_KEY_FILENAME, create=True
+            )
+            self.fernet = Fernet(key)
+            self.server_ssl_context, self.client_ssl_context = create_tls_contexts(
+                self.config_path
+            )
             self._load_cache()
             if bootstrap_host:
                 self._remember_peer(
@@ -490,12 +912,13 @@ class P2PPeerMesh:
                 )
         except (OSError, UnicodeError, ValueError) as error:
             self.events.put(("error", "No se pudo cargar la libreta de pares: {}".format(error)))
-            return
+            return False
 
         targets = [
             ("EvolutionPeerTcp", self._tcp_server),
             ("EvolutionPeerLan", self._lan_discovery),
             ("EvolutionPeerGossip", self._gossip_loop),
+            ("EvolutionPeerUpnp", self._network_setup),
         ]
         self.threads = [
             threading.Thread(target=target, name=name, daemon=True)
@@ -504,6 +927,7 @@ class P2PPeerMesh:
         for thread in self.threads:
             thread.start()
         self.events.put(("status", "started"))
+        return True
 
     def stop(self):
         self.stop_event.set()
@@ -512,7 +936,8 @@ class P2PPeerMesh:
                 listener.close()
             except OSError:
                 pass
-        self.save_cache()
+        if self.fernet is not None:
+            self.save_cache()
 
     def get_events(self):
         events = []
@@ -535,6 +960,10 @@ class P2PPeerMesh:
                 1 for last_seen in self.peers.values()
                 if now - last_seen <= self.PEER_TIMEOUT_SECONDS
             )
+
+    def address_count(self):
+        with self.lock:
+            return len(self.peers)
 
     def _remember_peer(self, host, last_seen=None):
         try:
@@ -560,28 +989,133 @@ class P2PPeerMesh:
             return list(self.peers.keys())[:self.MAX_PEERS]
 
     def _load_cache(self):
-        if not self.cache_path.exists():
-            return
-        with self.cache_path.open("r", encoding="utf-8") as cache_file:
-            for index, line in enumerate(cache_file):
-                if index >= self.MAX_PEERS:
-                    break
-                host = line.strip()
-                if host:
-                    self._remember_peer(
-                        host, time.monotonic() - self.PEER_TIMEOUT_SECONDS - 1
-                    )
+        cache = load_protected_peer_cache(self.cache_path, self.fernet)
+        for host, fingerprint in cache["fingerprints"].items():
+            if len(fingerprint) == 64:
+                self.peer_fingerprints[host] = fingerprint
+        for host in cache["peers"][:self.MAX_PEERS]:
+            try:
+                validate_peer_address(host)
+            except ValueError:
+                continue
+            else:
+                self._remember_peer(
+                    host, time.monotonic() - self.PEER_TIMEOUT_SECONDS - 1
+                )
 
     def save_cache(self):
         with self.cache_lock:
             peers = self._peer_snapshot()
-            if not peers:
-                return
+            with self.lock:
+                fingerprints = dict(self.peer_fingerprints)
+            cleartext = json.dumps(
+                {"peers": peers, "fingerprints": fingerprints},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            encrypted = self.fernet.encrypt(cleartext)
+            envelope = {
+                "version": 2,
+                "protection": "fernet",
+                "data": base64.b64encode(encrypted).decode("ascii"),
+            }
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = self.cache_path.with_name(self.cache_path.name + ".tmp")
             with temp_path.open("w", encoding="utf-8", newline="\n") as cache_file:
-                cache_file.write("\n".join(peers) + "\n")
+                json.dump(envelope, cache_file, separators=(",", ":"))
+                cache_file.write("\n")
             os.replace(str(temp_path), str(self.cache_path))
+
+    def _connect_tls(self, host):
+        raw_connection = socket.create_connection(
+            (host, GLOBAL_BOOTSTRAP_PORT), timeout=3
+        )
+        try:
+            connection = self.client_ssl_context.wrap_socket(
+                raw_connection, server_hostname=host
+            )
+        except (OSError, ValueError):
+            raw_connection.close()
+            raise
+        connection.settimeout(3)
+        certificate = connection.getpeercert(binary_form=True)
+        if not certificate:
+            connection.close()
+            raise ssl.SSLError("El par no presentó un certificado TLS.")
+        fingerprint = hashlib.sha256(certificate).hexdigest()
+        with self.lock:
+            expected = self.peer_fingerprints.get(host)
+            if expected and not hmac.compare_digest(expected, fingerprint):
+                connection.close()
+                raise ssl.SSLError(
+                    "Cambió la identidad TLS fijada para {}. Requiere verificación manual."
+                    .format(host)
+                )
+            is_first_use = expected is None
+            if is_first_use:
+                self.peer_fingerprints[host] = fingerprint
+        if is_first_use:
+            self.events.put(("tls_first_use", host, fingerprint))
+            self.save_cache()
+        return connection
+
+    def _network_setup(self):
+        try:
+            endpoint, service_type, internal_address = add_upnp_tcp_mapping(
+                GLOBAL_BOOTSTRAP_PORT
+            )
+            self.events.put(
+                (
+                    "network_setup",
+                    "UPnP asignó TCP:{} → {}.".format(
+                        GLOBAL_BOOTSTRAP_PORT, internal_address
+                    ),
+                )
+            )
+        except (OSError, urllib.error.URLError, ET.ParseError, ValueError) as error:
+            self.events.put(
+                (
+                    "network_setup",
+                    "UPnP no disponible; la conexión LAN/local sigue activa ({})"
+                    .format(error),
+                )
+            )
+            endpoint = None
+            service_type = None
+
+        try:
+            public_address = get_public_ip()
+            self.events.put(
+                ("public_ip", "IP externa detectada: {}".format(public_address))
+            )
+        except (OSError, urllib.error.URLError, ValueError) as error:
+            self.events.put(
+                ("public_ip_error", "No se pudo consultar api.ipify.org: {}".format(error))
+            )
+
+        if endpoint and service_type:
+            while not self.stop_event.wait(900):
+                try:
+                    add_upnp_tcp_mapping(GLOBAL_BOOTSTRAP_PORT)
+                except (OSError, urllib.error.URLError, ET.ParseError, ValueError) as error:
+                    self.events.put(
+                        ("network_setup", "No se pudo renovar el mapeo UPnP: {}".format(error))
+                    )
+            try:
+                _upnp_soap_request(
+                    endpoint,
+                    service_type,
+                    "DeletePortMapping",
+                    {
+                        "NewRemoteHost": "",
+                        "NewExternalPort": str(GLOBAL_BOOTSTRAP_PORT),
+                        "NewProtocol": "TCP",
+                    },
+                )
+            except (OSError, urllib.error.URLError, ValueError) as error:
+                if self.stop_event.is_set():
+                    self.events.put(
+                        ("network_setup", "No se pudo retirar el mapeo UPnP: {}".format(error))
+                    )
 
     def _tcp_server(self):
         try:
@@ -607,7 +1141,16 @@ class P2PPeerMesh:
 
                     def handle_exchange(client=connection, peer=address[0]):
                         try:
-                            self._handle_exchange(client, peer)
+                            client.settimeout(3)
+                            secure_client = self.server_ssl_context.wrap_socket(
+                                client, server_side=True
+                            )
+                            self._handle_exchange(secure_client, peer)
+                        except (OSError, ssl.SSLError) as error:
+                            if not self.stop_event.is_set():
+                                self.events.put(
+                                    ("peer_error", peer, "TLS: {}".format(error))
+                                )
                         finally:
                             self.connection_slots.release()
 
@@ -632,8 +1175,13 @@ class P2PPeerMesh:
                 data = self._receive_json_line(connection)
                 if not isinstance(data, dict) or data.get("protocol") != self.PROTOCOL_ID:
                     return
-                if data.get("type") != "exchange" or data.get("node_id") == self.node_id:
+                if data.get("node_id") == self.node_id:
                     return
+                if data.get("type") == "math_task":
+                    self._handle_math_task(connection, remote_host, data)
+                    return
+                if data.get("type") != "exchange":
+                    raise ValueError("Tipo de mensaje P2P no reconocido.")
                 self._remember_peer(remote_host)
                 candidates = data.get("peers", [])
                 if isinstance(candidates, list):
@@ -654,6 +1202,112 @@ class P2PPeerMesh:
             if not self.stop_event.is_set():
                 self.events.put(("peer_error", remote_host, str(error)))
 
+    def _handle_math_task(self, connection, remote_host, message):
+        task_id = message.get("task_id")
+        if not isinstance(task_id, str) or not 1 <= len(task_id) <= 80:
+            raise ValueError("Identificador de micro-tarea no válido.")
+        if self.stop_event.is_set() or self.paused_event.is_set():
+            response = {"type": "task_error", "task_id": task_id, "error": "paused"}
+        elif not self.task_slots.acquire(blocking=False):
+            response = {"type": "task_error", "task_id": task_id, "error": "busy"}
+        else:
+            try:
+                self._remember_peer(remote_host)
+                thread_cpu_start = time.thread_time()
+                result = calculate_math_task(
+                    message.get("task"), self.paused_event, self.stop_event
+                )
+                if self.paused_event.is_set() or self.stop_event.is_set():
+                    raise InterruptedError("El nodo pausó su participación.")
+                cpu_seconds = time.thread_time() - thread_cpu_start
+                remaining = max(
+                    MATH_TASK_COOLDOWN_SECONDS,
+                    cpu_seconds * (1.0 / 0.015 - 1.0),
+                )
+                while remaining > 0 and not self.stop_event.is_set():
+                    if self.paused_event.is_set():
+                        self.stop_event.wait(0.25)
+                        continue
+                    wait_started = time.monotonic()
+                    time.sleep(min(remaining, 0.25))
+                    remaining -= time.monotonic() - wait_started
+                if self.paused_event.is_set() or self.stop_event.is_set():
+                    raise InterruptedError("El nodo pausó su participación.")
+                self.processed_task_count += 1
+                self.events.put(("task_processed", self.processed_task_count))
+                response = {
+                    "type": "task_result",
+                    "task_id": task_id,
+                    "result": result,
+                }
+            except (ValueError, InterruptedError) as error:
+                response = {
+                    "type": "task_error",
+                    "task_id": task_id,
+                    "error": str(error)[:200],
+                }
+            finally:
+                self.task_slots.release()
+        payload = {
+            "protocol": self.PROTOCOL_ID,
+            "node_id": self.node_id,
+        }
+        payload.update(response)
+        connection.sendall(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
+        )
+        if response["type"] == "task_result":
+            self.events.put(("task_served", remote_host, task_id))
+
+    def submit_math_task(self, task):
+        calculate_math_task(task)
+        peers = self._peer_snapshot()
+        if not peers:
+            self.events.put(("task_error", "No hay pares conocidos para recibir la tarea."))
+            return
+        task_id = str(uuid.uuid4())
+        for host in peers[:8]:
+            threading.Thread(
+                target=self._send_math_task,
+                args=(host, task_id, task),
+                name="EvolutionMathTask",
+                daemon=True,
+            ).start()
+
+    def _send_math_task(self, host, task_id, task):
+        if self.stop_event.is_set() or self.paused_event.is_set():
+            return
+        try:
+            with self._connect_tls(host) as connection:
+                request = {
+                    "protocol": self.PROTOCOL_ID,
+                    "type": "math_task",
+                    "node_id": self.node_id,
+                    "task_id": task_id,
+                    "task": task,
+                }
+                encoded = json.dumps(
+                    request, separators=(",", ":")
+                ).encode("utf-8") + b"\n"
+                if len(encoded) > self.MAX_MESSAGE_BYTES:
+                    raise ValueError("La micro-tarea supera el tamaño permitido.")
+                connection.sendall(encoded)
+                response = self._receive_json_line(connection)
+            if (
+                not isinstance(response, dict)
+                or response.get("protocol") != self.PROTOCOL_ID
+                or response.get("task_id") != task_id
+            ):
+                raise ValueError("Respuesta de micro-tarea no válida.")
+            if response.get("type") == "task_result":
+                self.events.put(("task_result", host, response.get("result")))
+            else:
+                self.events.put(
+                    ("task_error", "{}: {}".format(host, response.get("error", "rechazada")))
+                )
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+            self.events.put(("task_error", "{}: {}".format(host, error)))
+
     def _receive_json_line(self, connection):
         data = bytearray()
         while len(data) < self.MAX_MESSAGE_BYTES:
@@ -673,10 +1327,7 @@ class P2PPeerMesh:
         if self.stop_event.is_set() or self.paused_event.is_set():
             return
         try:
-            with socket.create_connection(
-                (host, GLOBAL_BOOTSTRAP_PORT), timeout=3
-            ) as connection:
-                connection.settimeout(3)
+            with self._connect_tls(host) as connection:
                 request = {
                     "protocol": self.PROTOCOL_ID,
                     "type": "exchange",
@@ -807,11 +1458,13 @@ class EvolutionNodeApp:
     def __init__(self, root, record_store):
         self.root = root
         self.record_store = record_store
+        self.is_admin = is_windows_admin()
         self.closing = False
         self.flush_in_progress = False
         self.mesh = None
         self.mesh_poll_id = None
         self.node_id = str(uuid.uuid4())
+        self.math_task_count = 0
         self.cpu_monitor_stop = threading.Event()
         self.cpu_pause_event = threading.Event()
         self.cpu_pause_event.set()
@@ -872,6 +1525,28 @@ class EvolutionNodeApp:
                 )
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self.root.after(LOG_FLUSH_INTERVAL_MS, self._periodic_flush)
+        self.root.after(100, self._show_privilege_notice)
+
+    def _show_privilege_notice(self):
+        if self.closing or not self.root.winfo_exists():
+            return
+        if platform.system().lower() != "windows":
+            message = (
+                "Modo multiplataforma activo. La telemetría y la malla P2P están "
+                "disponibles; SFC y Windows Defender solo existen en Windows."
+            )
+        elif self.is_admin:
+            message = (
+                "Modo Técnico Avanzado Desbloqueado. Herramientas de reparación "
+                "del sistema SFC y Windows Defender listas."
+            )
+        else:
+            message = (
+                "Modo Estándar Activo. Optimización de memoria disponible. Para "
+                "habilitar mantenimiento avanzado, SFC Scannow y Windows Defender, "
+                "ejecute como Administrador."
+            )
+        messagebox.showinfo(APP_TITLE, message, parent=self.root)
 
     def _build_interface(self):
         container = ttk.Frame(self.root, padding=16)
@@ -882,7 +1557,7 @@ class EvolutionNodeApp:
             container,
             text=APP_ATTRIBUTION,
         ).pack(anchor=tk.W, pady=(2, 4))
-        ttk.Label(container, text="Nodo voluntario").pack(anchor=tk.W)
+        ttk.Label(container, text=VOLUNTEER_ROLE).pack(anchor=tk.W)
         ttk.Label(
             container,
             text=(
@@ -917,18 +1592,21 @@ class EvolutionNodeApp:
         for column in range(3):
             options.columnconfigure(column, weight=1)
 
-        startup_options = ttk.LabelFrame(container, text="Inicio de Windows", padding=8)
-        startup_options.pack(fill=tk.X, pady=(0, 10))
-        self.startup_check = ttk.Checkbutton(
-            startup_options,
-            text="Abrir Evolution al iniciar sesión en Windows",
-            variable=self.startup_var,
-            command=self._toggle_startup,
-        )
-        self.startup_check.pack(anchor=tk.W)
-        ttk.Label(
-            startup_options, textvariable=self.startup_status, wraplength=740
-        ).pack(anchor=tk.W, pady=(4, 0))
+        if platform.system().lower() == "windows":
+            startup_options = ttk.LabelFrame(
+                container, text="Inicio de Windows", padding=8
+            )
+            startup_options.pack(fill=tk.X, pady=(0, 10))
+            self.startup_check = ttk.Checkbutton(
+                startup_options,
+                text="Abrir Evolution al iniciar sesión en Windows",
+                variable=self.startup_var,
+                command=self._toggle_startup,
+            )
+            self.startup_check.pack(anchor=tk.W)
+            ttk.Label(
+                startup_options, textvariable=self.startup_status, wraplength=740
+            ).pack(anchor=tk.W, pady=(4, 0))
 
         self.mesh_controls = ttk.LabelFrame(
             container, text="Red P2P voluntaria", padding=10
@@ -938,10 +1616,15 @@ class EvolutionNodeApp:
             self.mesh_controls,
             text=(
                 "Al participar, este equipo intercambia direcciones de pares por TCP "
-                "en el puerto {} y anuncia descubrimiento en la LAN. El protocolo "
-                "intercambia solo identificadores y direcciones: no ejecuta trabajos "
-                "remotos. Para conexiones por Internet, configura el reenvío del "
-                "puerto TCP en el router y permite el puerto en el firewall."
+                "en el puerto {} y anuncia descubrimiento en la LAN. También puede "
+                "recibir micro-tareas JSON matemáticas con límites fijos; "
+                "nunca ejecuta código o expresiones arbitrarias. El consumo reducido "
+                "busca aproximadamente el 1.5% de CPU, no es un límite duro. "
+                "TLS cifra las conexiones con identidad TOFU: confirma por otro canal "
+                "la huella del primer contacto; una conexión inicial no verificada "
+                "puede ser interceptada. Se intentará UPnP y se consultará "
+                "api.ipify.org para detectar la IP pública. Si UPnP falla, la LAN "
+                "sigue disponible; para Internet se requiere router/firewall."
             ).format(GLOBAL_BOOTSTRAP_PORT),
             wraplength=740,
         ).grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 8))
@@ -971,6 +1654,21 @@ class EvolutionNodeApp:
         self.mesh_status_label.grid(
             row=3, column=0, columnspan=4, sticky=tk.W, pady=(2, 4)
         )
+        self.math_task_count_var = tk.StringVar(
+            value="Micro-tareas matemáticas procesadas por el enjambre: 0 (contador local)"
+        )
+        ttk.Label(
+            self.mesh_controls, textvariable=self.math_task_count_var
+        ).grid(row=4, column=0, columnspan=4, sticky=tk.W, pady=(2, 4))
+        self.math_task_button = ttk.Button(
+            self.mesh_controls,
+            text="Enviar micro-tarea educativa (suma de matrices)",
+            command=self._submit_sample_math_task,
+            state=tk.DISABLED,
+        )
+        self.math_task_button.grid(
+            row=5, column=0, columnspan=4, sticky="ew", pady=(2, 6)
+        )
         self.cpu_status = tk.StringVar(value="Monitor de CPU iniciándose...")
         self.cpu_status_label = ttk.Label(
             self.mesh_controls,
@@ -978,7 +1676,7 @@ class EvolutionNodeApp:
             wraplength=740,
         )
         self.cpu_status_label.grid(
-            row=4, column=0, columnspan=4, sticky=tk.W, pady=(2, 4)
+            row=6, column=0, columnspan=4, sticky=tk.W, pady=(2, 4)
         )
         ttk.Label(
             self.mesh_controls,
@@ -987,7 +1685,7 @@ class EvolutionNodeApp:
                 "nodo; no comparte datos personales ni ejecuta tareas remotas."
             ),
             wraplength=740,
-        ).grid(row=5, column=0, columnspan=4, sticky=tk.W, pady=(4, 8))
+        ).grid(row=7, column=0, columnspan=4, sticky=tk.W, pady=(4, 8))
         self.mesh_controls.columnconfigure(1, weight=1)
 
         ttk.Label(container, text="Resultado de la última operación:").pack(anchor=tk.W)
@@ -1004,9 +1702,8 @@ class EvolutionNodeApp:
         ).pack(anchor=tk.W, pady=(6, 0))
 
         if platform.system().lower() != "windows":
-            self.startup_check.configure(state=tk.DISABLED)
             self.node_status.set(
-                "El inicio automático está disponible solo en Windows; la malla no está configurada."
+                "Mantenimiento de Windows no está disponible; malla P2P multiplataforma lista."
             )
 
     def _toggle_startup(self):
@@ -1083,7 +1780,7 @@ class EvolutionNodeApp:
                         mesh.set_paused(True)
                     self.cpu_monitor_events.put(("error", str(error)))
                     return
-                should_pause = cpu_percent > CPU_PAUSE_THRESHOLD_PERCENT
+                should_pause = cpu_percent >= CPU_PAUSE_THRESHOLD_PERCENT
                 mesh = self.mesh
                 if mesh is not None:
                     mesh.set_paused(should_pause)
@@ -1123,7 +1820,8 @@ class EvolutionNodeApp:
                     self.cpu_status.set(
                         "Pausa LOCAL del intercambio P2P: CPU {:.1f}% supera {:.0f}%. "
                         "Se detiene el gossip saliente de este equipo; otros nodos "
-                        "siguen independientes. No hay tareas remotas ejecutándose."
+                        "siguen independientes; las tareas entrantes se rechazan o "
+                        "pausan cooperativamente."
                         .format(
                             cpu_percent, CPU_PAUSE_THRESHOLD_PERCENT
                         )
@@ -1132,8 +1830,8 @@ class EvolutionNodeApp:
                 else:
                     self.cpu_status.set(
                         "CPU local {:.1f}%: bajo el umbral de {:.0f}%. El intercambio "
-                        "P2P saliente puede continuar; no hay tareas remotas "
-                        "ejecutándose.".format(
+                        "P2P saliente y las micro-tareas limitadas pueden continuar."
+                        .format(
                             cpu_percent, CPU_PAUSE_THRESHOLD_PERCENT
                         )
                     )
@@ -1157,7 +1855,7 @@ class EvolutionNodeApp:
     def _run_async(self, title, operation, on_success=None):
         if self.task_running:
             messagebox.showinfo(APP_TITLE, "Espera a que termine la operación actual.")
-            return
+            return False
         self.task_running = True
         self.operation_status.set(title)
 
@@ -1173,6 +1871,7 @@ class EvolutionNodeApp:
                 )
 
         threading.Thread(target=run, name="EvolutionTask", daemon=True).start()
+        return True
 
     def _task_failed(self, error):
         self.task_running = False
@@ -1192,10 +1891,33 @@ class EvolutionNodeApp:
 
     def _review_integrity(self):
         if platform.system().lower() != "windows":
-            messagebox.showinfo(
-                APP_TITLE, "La verificación SFC está disponible únicamente en Windows."
+            self._show_local_read_only_panel()
+            self.operation_status.set(
+                "SFC y Windows Defender solo están disponibles en Windows."
             )
             return
+        if not self.is_admin:
+            self._audit_node()
+            return
+        if not messagebox.askyesno(
+            APP_TITLE,
+            "Se iniciarán en paralelo SFC /scannow y un análisis rápido de "
+            "Windows Defender. Ambas tareas pueden tardar varios minutos. ¿Continuar?",
+            parent=self.root,
+        ):
+            return
+        if not self._run_async(
+            "Iniciando reparación y análisis de seguridad...",
+            self._run_admin_scans,
+        ):
+            return
+        messagebox.showinfo(
+            APP_TITLE,
+            "Mantenimiento profundo en ejecución: Procesando SFC Scannow y análisis "
+            "de Windows Defender en segundo plano...",
+            parent=self.root,
+        )
+        return
 
         def verify():
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -1221,7 +1943,178 @@ class EvolutionNodeApp:
 
         self._run_async("Verificando integridad de Windows...", verify)
 
+    def _find_defender_command(self):
+        program_files = get_windows_folder(0x0026)
+        candidates = [program_files / "Windows Defender" / "MpCmdRun.exe"]
+        program_data = get_windows_folder(0x0023)
+        platform_dir = program_data / "Microsoft" / "Windows Defender" / "Platform"
+        if platform_dir.is_dir():
+            candidates.extend(
+                sorted(
+                    platform_dir.glob("*/MpCmdRun.exe"),
+                    key=lambda path: path.parent.name,
+                    reverse=True,
+                )
+            )
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        raise FileNotFoundError("No se encontró MpCmdRun.exe de Windows Defender.")
+
+    def _run_admin_scans(self):
+        defender_path = self._find_defender_command()
+        scans = [
+            ("SFC /scannow", ["sfc", "/scannow"]),
+            (
+                "Windows Defender",
+                [str(defender_path), "-Scan", "-ScanType", "1"],
+            ),
+        ]
+        results = []
+        result_lock = threading.Lock()
+
+        def run_scan(name, command):
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=4 * 60 * 60,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                details = ((result.stdout or "") + (result.stderr or "")).strip()
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        "código {}: {}".format(
+                            result.returncode,
+                            details or "el comando no proporcionó detalles",
+                        )
+                    )
+                outcome = "{} finalizó correctamente (código {}).".format(
+                    name, result.returncode
+                )
+                if details:
+                    outcome += "\n" + details[-6000:]
+                success = True
+            except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+                outcome = "{} falló: {}".format(name, error)
+                success = False
+            with result_lock:
+                results.append((name, success, outcome))
+
+        workers = [
+            threading.Thread(
+                target=run_scan,
+                args=(name, command),
+                name="Evolution" + name.replace(" ", "").replace("/", ""),
+                daemon=True,
+            )
+            for name, command in scans
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        results.sort(key=lambda result: result[0])
+        summary = "\n\n".join(result[2] for result in results)
+        failed = [result[0] for result in results if not result[1]]
+        if failed:
+            raise RuntimeError(
+                "Fallaron uno o más análisis ({}).\n\n{}".format(
+                    ", ".join(failed), summary
+                )
+            )
+        return summary
+
     def _optimize_local_process(self):
+        system = platform.system().lower()
+        if self.is_admin and system == "windows":
+            if not messagebox.askyesno(
+                APP_TITLE,
+                "Se eliminarán los elementos accesibles dentro de C:\\Windows\\Temp "
+                "y de la carpeta Temp de este usuario. Archivos protegidos, enlaces "
+                "y elementos en uso se omitirán. ¿Continuar?",
+                parent=self.root,
+            ):
+                return
+
+            def optimize():
+                collected = gc.collect()
+                temp_paths = [
+                    get_windows_folder(0x0024) / "Temp",
+                    get_windows_folder(0x001C) / "Temp",
+                ]
+                results = [
+                    "Objetos Python liberados por gc.collect(): {}.".format(collected)
+                ]
+                for temp_path in temp_paths:
+                    try:
+                        removed, skipped = clear_temp_directory(temp_path)
+                    except OSError as error:
+                        results.append("{}: error: {}".format(temp_path, error))
+                        continue
+                    results.append(
+                        "{}: {} elementos eliminados; {} omitidos.".format(
+                            temp_path, removed, len(skipped)
+                        )
+                    )
+                    if skipped:
+                        results.append("Omitidos:\n" + "\n".join(skipped[:20]))
+                return "\n\n".join(results)
+
+            self._run_async("Optimizando memoria y temporales...", optimize)
+            return
+
+        if self.is_admin and system in ("linux", "darwin"):
+            temp_path = Path(tempfile.gettempdir())
+            if not temp_path.is_dir():
+                messagebox.showerror(
+                    APP_TITLE,
+                    "No se encontró la carpeta temporal del sistema: {}".format(
+                        temp_path
+                    ),
+                    parent=self.root,
+                )
+                return
+            if not messagebox.askyesno(
+                APP_TITLE,
+                "Se eliminarán los archivos accesibles dentro de la carpeta temporal "
+                "del sistema ({}). Archivos en uso y enlaces se omitirán. "
+                "¿Continuar?".format(temp_path),
+                parent=self.root,
+            ):
+                return
+
+            def optimize_unix():
+                collected = gc.collect()
+                removed, skipped = clear_temp_directory(temp_path)
+                results = [
+                    "Objetos Python liberados por gc.collect(): {}.".format(collected),
+                    "{}: {} elementos eliminados; {} omitidos.".format(
+                        temp_path, removed, len(skipped)
+                    ),
+                ]
+                if skipped:
+                    results.append("Omitidos:\n" + "\n".join(skipped[:20]))
+                return "\n\n".join(results)
+
+            self._run_async(
+                "Optimizando memoria y temporales del sistema...", optimize_unix
+            )
+            return
+
+        def optimize():
+            collected = gc.collect()
+            return (
+                "Optimización de memoria del proceso completada. "
+                "gc.collect() liberó {} objetos Python no referenciados."
+            ).format(collected)
+
+        self._run_async("Optimizando memoria local...", optimize)
+        return
         if platform.system().lower() != "windows":
             messagebox.showinfo(APP_TITLE, "El mantenimiento del sistema está disponible solo en Windows.")
             return
@@ -1376,42 +2269,152 @@ class EvolutionNodeApp:
 
         self._run_async("Ejecutando mantenimiento de Windows...", maintain)
 
-    def _audit_node(self):
-        def audit():
-            logical_cpus, total_ram, available_ram = get_hardware_info()
-            records = self.record_store.read()
-            record_count = sum(1 for line in records.splitlines() if line.strip())
-            return (
-                "Auditoría local\n"
-                "Procesadores lógicos: {}\nRAM total: {}\nRAM disponible: {}\n"
-                "Registros locales visibles: {}\n"
-                "Pares P2P descubiertos: {}. El protocolo actual solo intercambia "
-                "direcciones; no distribuye ni ejecuta tareas."
-            ).format(
-                logical_cpus,
-                format_bytes(total_ram),
-                format_bytes(available_ram),
-                record_count,
-                self.mesh.peer_count() if self.mesh else 0,
+    def _show_local_read_only_panel(self):
+        window = tk.Toplevel(self.root)
+        window.title("Panel local de recursos — solo lectura")
+        window.geometry("480x260")
+        window.transient(self.root)
+        panel = ttk.LabelFrame(window, text="Telemetría del equipo", padding=16)
+        panel.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        variables = {
+            "role": tk.StringVar(value=VOLUNTEER_ROLE),
+            "cpus": tk.StringVar(value="Detectando..."),
+            "cpu": tk.StringVar(value="Leyendo..."),
+            "ram": tk.StringVar(value="Leyendo..."),
+            "app_ram": tk.StringVar(value="No disponible"),
+        }
+        for row, (label, key) in enumerate(
+            (
+                ("Rol", "role"),
+                ("Procesadores lógicos", "cpus"),
+                ("Uso de CPU", "cpu"),
+                ("Memoria física", "ram"),
+                ("Memoria del proceso Evolution", "app_ram"),
             )
+        ):
+            ttk.Label(panel, text=label + ":").grid(
+                row=row, column=0, sticky=tk.W, padx=(0, 12), pady=5
+            )
+            ttk.Label(panel, textvariable=variables[key]).grid(
+                row=row, column=1, sticky=tk.W, pady=5
+            )
+        panel.columnconfigure(1, weight=1)
+        after_id = [None]
 
-        self._run_async("Auditando el nodo local...", audit)
+        def refresh():
+            if not window.winfo_exists():
+                return
+            try:
+                logical_cpus, total_ram, available_ram = get_hardware_info()
+                variables["cpus"].set(str(logical_cpus))
+                variables["ram"].set(
+                    "{} total / {} disponible".format(
+                        format_bytes(total_ram), format_bytes(available_ram)
+                    )
+                )
+            except (OSError, ValueError) as error:
+                variables["ram"].set("Error: {}".format(error))
+            try:
+                import psutil
+
+                variables["cpu"].set(
+                    "{:.1f}%".format(psutil.cpu_percent(interval=None))
+                )
+                variables["app_ram"].set(
+                    format_bytes(psutil.Process().memory_info().rss)
+                )
+            except ImportError as error:
+                variables["cpu"].set("No disponible: {}".format(error))
+                variables["app_ram"].set("No disponible")
+            except (psutil.Error, OSError) as error:
+                variables["cpu"].set("No disponible: {}".format(error))
+                variables["app_ram"].set("No disponible")
+            after_id[0] = window.after(1000, refresh)
+
+        def close_panel():
+            if after_id[0] is not None:
+                window.after_cancel(after_id[0])
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", close_panel)
+        refresh()
+
+    def _show_mesh_read_only_panel(self):
+        window = tk.Toplevel(self.root)
+        window.title("Control de participación — solo lectura")
+        window.geometry("560x300")
+        window.transient(self.root)
+        panel = ttk.LabelFrame(window, text="Estado de sincronización P2P", padding=16)
+        panel.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        status = tk.StringVar()
+        active = tk.StringVar()
+        known = tk.StringVar()
+        tasks = tk.StringVar(value="0")
+        port = tk.StringVar(value=str(GLOBAL_BOOTSTRAP_PORT))
+        cache = tk.StringVar(value=str(get_mesh_cache_path()))
+        fields = (
+            ("Estado", status),
+            ("Pares activos", active),
+            ("Direcciones en libreta", known),
+            ("Micro-tareas observadas en este nodo", tasks),
+            ("Puerto TCP", port),
+            ("Archivo local de pares", cache),
+        )
+        for row, (label, variable) in enumerate(fields):
+            ttk.Label(panel, text=label + ":").grid(
+                row=row, column=0, sticky=tk.NW, padx=(0, 12), pady=5
+            )
+            ttk.Label(
+                panel, textvariable=variable, wraplength=390, justify=tk.LEFT
+            ).grid(row=row, column=1, sticky=tk.NW, pady=5)
+        panel.columnconfigure(1, weight=1)
+        after_id = [None]
+
+        def refresh():
+            if not window.winfo_exists():
+                return
+            mesh = self.mesh
+            status.set(
+                "Conexión habilitada" if mesh else "Conexión desactivada"
+            )
+            active.set(str(mesh.peer_count()) if mesh else "0")
+            tasks.set(str(self.math_task_count))
+            if mesh:
+                known.set(str(mesh.address_count()))
+            else:
+                try:
+                    known.set(
+                        str(
+                            len(
+                                read_protected_peer_cache(
+                                    get_mesh_cache_path()
+                                )["peers"]
+                            )
+                        )
+                    )
+                except (OSError, UnicodeError, ValueError) as error:
+                    known.set("No disponible: {}".format(error))
+            after_id[0] = window.after(1500, refresh)
+
+        def close_panel():
+            if after_id[0] is not None:
+                window.after_cancel(after_id[0])
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", close_panel)
+        refresh()
+
+    def _audit_node(self):
+        self._show_local_read_only_panel()
 
     def _show_mesh_controls(self):
-        self.mesh_controls.focus_set()
-        self._set_output(
-            "Red P2P voluntaria\n"
-            "Este prototipo comparte direcciones de pares mediante TCP y anuncios "
-            "UDP en la LAN. Solo comparte identificadores y direcciones; todavía "
-            "no distribuye cálculos ni ejecuta código remoto. Para aceptar conexiones "
-            "desde Internet, abre TCP:{} en el firewall y reenvíalo en el router."
-            .format(GLOBAL_BOOTSTRAP_PORT)
-        )
+        self._show_mesh_read_only_panel()
 
     def _toggle_mesh_connection(self):
         if not self.mesh_enabled_var.get():
             mesh = self.mesh
             self.mesh = None
+            self.math_task_button.configure(state=tk.DISABLED)
             if mesh:
                 try:
                     mesh.stop()
@@ -1434,10 +2437,13 @@ class EvolutionNodeApp:
             APP_TITLE,
             "Al activar la red, este equipo escuchará conexiones P2P entrantes en "
             "TCP:{} y anunciará un identificador aleatorio por UDP en la LAN. "
-            "Compartirá direcciones IP/dominios de pares, no tareas ni datos personales. "
+            "Compartirá direcciones IP/dominios de pares y podrá recibir tareas "
+            "JSON limitadas a cálculos matemáticos; no ejecutará código arbitrario. "
+            "Se intentará abrir el puerto mediante UPnP y consultar api.ipify.org. "
             "¿Activar la conexión?".format(
                 GLOBAL_BOOTSTRAP_PORT
             ),
+            icon=messagebox.WARNING,
             parent=self.root,
         ):
             self.mesh_enabled_var.set(False)
@@ -1471,19 +2477,62 @@ class EvolutionNodeApp:
             self.mesh_enabled_var.set(False)
             return
         self.mesh = P2PPeerMesh(self.node_id, cache_path)
-        self.mesh.start(host)
         self.mesh.set_paused(self.cpu_pause_event.is_set())
+        if not self.mesh.start(host):
+            errors = self.mesh.get_events()
+            self.mesh = None
+            self.mesh_enabled_var.set(False)
+            self.math_task_button.configure(state=tk.DISABLED)
+            self.mesh_host_entry.configure(state=tk.NORMAL)
+            error_message = next(
+                (event[1] for event in errors if event[0] == "error"),
+                "No se pudo inicializar el cifrado local de la malla.",
+            )
+            messagebox.showerror(
+                APP_TITLE, error_message, parent=self.root
+            )
+            return
         self.mesh_host_entry.configure(state=tk.DISABLED)
         self.mesh_status.set(
             "P2P activado; conectando y buscando pares conocidos. "
-            "No se ejecutan tareas remotas."
+            "Las micro-tareas matemáticas están limitadas a operaciones permitidas."
         )
         self.mesh_status_label.configure(foreground="#9a6700")
+        self.math_task_button.configure(state=tk.NORMAL)
         self._set_output(
             "P2P voluntario activo. Intentando intercambio TCP con pares guardados "
-            "y descubrimiento UDP en la LAN. No se envían ni ejecutan tareas."
+            "y descubrimiento UDP en la LAN. Solo se admiten micro-tareas matemáticas "
+            "JSON permitidas."
         )
         self._poll_mesh_discovery()
+
+    def _submit_sample_math_task(self):
+        mesh = self.mesh
+        if mesh is None:
+            messagebox.showinfo(
+                APP_TITLE,
+                "Activa primero la conexión voluntaria a la red.",
+                parent=self.root,
+            )
+            return
+        if self.cpu_pause_event.is_set():
+            messagebox.showinfo(
+                APP_TITLE,
+                "La CPU local está por encima del umbral; el trabajo está pausado.",
+                parent=self.root,
+            )
+            return
+        task = {
+            "task_type": "matrix_add",
+            "left": [[1, 2], [3, 4]],
+            "right": [[5, 6], [7, 8]],
+        }
+        try:
+            mesh.submit_math_task(task)
+        except ValueError as error:
+            messagebox.showerror(APP_TITLE, str(error), parent=self.root)
+            return
+        self.operation_status.set("Enviando micro-tarea matemática a pares conocidos...")
 
     def _poll_mesh_discovery(self):
         self.mesh_poll_id = None
@@ -1502,7 +2551,7 @@ class EvolutionNodeApp:
                     )
                 else:
                     self.mesh_status.set(
-                        "P2P activo; buscando pares. No se ejecutan tareas remotas."
+                        "P2P activo; buscando pares para micro-tareas matemáticas."
                     )
                 self.mesh_status_label.configure(
                     foreground="#00a83b" if peer_count else "#9a6700"
@@ -1515,14 +2564,42 @@ class EvolutionNodeApp:
                 self.mesh_status.set(event[1])
                 self.mesh_status_label.configure(foreground="#b42318")
                 messagebox.showerror(APP_TITLE, event[1], parent=self.root)
-            elif event_type == "peer":
-                self.record_store.add_peer(event[1])
             elif event_type == "peer_error":
                 self.operation_status.set(
                     "No se pudo intercambiar pares con {}: {}".format(
                         event[1], event[2]
                     )
                 )
+            elif event_type == "tls_first_use":
+                self.operation_status.set(
+                    "Nueva identidad TLS (TOFU) para {}. Verifica por otro canal "
+                    "esta huella SHA-256: {}".format(event[1], event[2])
+                )
+            elif event_type in ("network_setup", "public_ip"):
+                self.operation_status.set(event[1])
+            elif event_type == "public_ip_error":
+                self.operation_status.set(event[1])
+            elif event_type == "task_result":
+                self.math_task_count += 1
+                self.math_task_count_var.set(
+                    "Micro-tareas matemáticas procesadas por el enjambre: {} "
+                    "(contador local)".format(
+                        self.math_task_count
+                    )
+                )
+                self.operation_status.set(
+                    "Un par devolvió el resultado matemático: {}".format(event[2])
+                )
+            elif event_type == "task_processed":
+                self.math_task_count += 1
+                self.math_task_count_var.set(
+                    "Micro-tareas matemáticas procesadas por el enjambre: {} "
+                    "(contador local)".format(
+                        self.math_task_count
+                    )
+                )
+            elif event_type == "task_error":
+                self.operation_status.set("Micro-tarea no completada: {}".format(event[1]))
 
         if self.mesh is mesh:
             self.mesh_poll_id = self.root.after(
@@ -1669,7 +2746,7 @@ def main():
     root = tk.Tk()
     try:
         record_store = LocalRecordStore(get_log_path())
-        record_store.add("Nodo voluntario", VOLUNTEER_ROLE)
+        record_store.add("NODO PRINCIPAL / COOPERANTE", VOLUNTEER_ROLE)
         EvolutionNodeApp(root, record_store)
     except (OSError, RuntimeError, ValueError) as error:
         messagebox.showerror(
