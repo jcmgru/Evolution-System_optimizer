@@ -29,11 +29,7 @@ jobs:
         run: python -m pip install --upgrade pyinstaller customtkinter psutil
 
       - name: Compile Windows application
-        run: >-
-          python -m PyInstaller --clean --onefile --windowed
-          --name "Evolution System v7.7.7 Absoluta"
-          --collect-all customtkinter --collect-all psutil
-          "Evolution System v7.7.7 Absoluta.py"
+        run: python -m PyInstaller --clean --onefile --windowed --name "Evolution System v7.7.7 Absoluta" --collect-all customtkinter --collect-all psutil "Evolution System v7.7.7 Absoluta.py"
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
